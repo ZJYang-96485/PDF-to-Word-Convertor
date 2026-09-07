@@ -597,6 +597,11 @@ class MacWordConverter:
                 overwrite=True,
                 status_callback=status_callback,
             )
+        except ConversionDependencyError:
+            # Preserve the precise installation guidance for a missing
+            # pdf2docx dependency instead of replacing it with a generic
+            # "fallback failed" message.
+            raise
         except PDFConversionError as fallback_exc:
             raise OutputError(
                 f"Word for Mac and the editable fallback could not convert {pdf}: {fallback_exc}",
