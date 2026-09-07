@@ -1,58 +1,96 @@
-# PDF to Word Converter
+# PDF to Word Convertor
 
-A small Windows desktop application that converts PDF files to editable Microsoft Word `.docx` documents through Microsoft Word's own PDF conversion engine.
+This VS Code-ready desktop application converts PDF files into visually faithful Microsoft Word `.docx` documents.
+
+It is designed for PDFs produced by TeX/LaTeX and other layout-sensitive sources. Each PDF page is rendered at high resolution and placed on a matching, marginless Word page. That preserves the source fonts, LaTeX rendering, diagrams, spacing, page size, and ordering far more reliably than a text reflow conversion.
+
+The result is visually faithful, but the text and equations are preserved as page images rather than individually editable Word objects.
 
 ## Requirements
 
-- Windows 10 or Windows 11
 - Python 3.10 or newer
-- The desktop version of Microsoft Word
-- `pywin32`
+- Tkinter, which is included with most desktop Python installations
+- PyMuPDF
+- python-docx
 
-Microsoft Word must be installed and activated on the same Windows computer as the application. The app does not use `pdf2docx` or reconstruct the PDF itself.
+The app runs on Windows, macOS, and Linux. Microsoft Word is not required to perform the conversion.
 
 ## Installation
 
-```text
+From this repository directory:
+
+```bash
 python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
 ```
 
-## Running
+Activate the environment.
 
-```text
+On Windows PowerShell:
+
+```powershell
+.venv\Scripts\Activate.ps1
+```
+
+On macOS or Linux:
+
+```bash
+source .venv/bin/activate
+```
+
+Install dependencies:
+
+```bash
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+## Run the desktop app
+
+```bash
 python app.py
 ```
 
-Select a PDF, adjust the output filename if needed, and click **Convert to Word**. The **Add PDFs** and **Convert All** controls support sequential batch conversion while reusing one Microsoft Word instance.
+The app supports:
 
-The default output keeps the source filename and changes only the extension. Spaces, capitalization, parentheses, and Unicode characters are preserved.
+- single-file conversion with a selectable output path;
+- sequential batch conversion, saving each `.docx` beside its source PDF;
+- configurable rendering resolution from 72 to 600 DPI;
+- overwrite confirmation before an existing Word file is replaced;
+- background conversion so the interface stays responsive;
+- cancellation between PDF pages and between batch items.
 
-## How conversion works
+## Command-line conversion
 
-The application opens the PDF in Microsoft Word using COM automation, lets Word perform its native PDF reflow/import, and saves the result as a DOCX file. Conversion quality should therefore be approximately equivalent to manually opening the PDF in Word and saving it as DOCX.
+The conversion engine can also be used without the GUI:
 
-The interface remains responsive because Word automation runs in a background thread. COM is initialized and uninitialized inside that worker, and Word is closed even when conversion fails.
-
-## Limitations
-
-- Complex PDFs may still change layout because Word's PDF import is a reflow conversion.
-- Scanned PDFs may require OCR before their text becomes editable.
-- Password-protected PDFs may fail to open.
-- Some equations, fonts, and complicated diagrams may not remain fully editable.
-- This application requires Windows and the desktop version of Microsoft Word.
-- A cancellation request safely stops after the current Word operation; it does not forcibly terminate Word while it is saving.
-
-Technical exception details are written to `pdf_to_word_converter.log` beside the application when the directory is writable.
-
-## Packaging with PyInstaller
-
-After testing the source on Windows, a single-file GUI executable can be built with:
-
-```text
-pyinstaller --noconsole --onefile --name "PDF to Word Converter" app.py
+```bash
+python converter.py "/path/to/input.pdf" --output "/path/to/output.docx"
 ```
 
-`pywin32` is imported lazily by `converter.py`, which keeps the source compatible with PyInstaller and allows the GUI to display a helpful message on unsupported operating systems. If a specific PyInstaller environment needs additional pywin32 collection hooks, install the latest PyInstaller and rebuild in that Windows environment.
+The default is 300 DPI:
+
+```bash
+python converter.py "/path/to/input.pdf" --dpi 300
+```
+
+If `--output` is omitted, the Word file is written beside the input PDF with the same filename stem.
+
+## Example
+
+```bash
+python converter.py "/Users/zhy/Downloads/MSE 401 HW2.pdf" \
+  --output "/Users/zhy/Documents/Codex/2026-09-07/h-e-l/outputs/MSE 401 HW2.docx"
+```
+
+## Project layout
+
+```text
+PDF-to-Word-Convertor/
+├── .vscode/
+├── app.py
+├── converter.py
+├── PDF-to-Word-Convertor.code-workspace
+├── README.md
+└── requirements.txt
+```
 

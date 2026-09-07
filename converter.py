@@ -1,76 +1,48 @@
-"""Microsoft Word based PDF-to-DOCX conversion.
-
-The conversion is intentionally delegated to Microsoft Word.  Word's PDF
-importer is responsible for reflowing the document, which generally produces
-the same result as opening the PDF manually in Word and saving it as DOCX.
-
-This module does not import pywin32 at module import time.  That keeps the GUI
-able to start on non-Windows systems and lets it show a useful Windows-only
-message instead of failing with an ImportError.
-"""
+"""High-fidelity PDF-to-DOCX conversion and command-line entry point."""
 
 from __future__ import annotations
 
-import gc
+import argparse
 import logging
 import os
-import platform
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from threading import Event
 from typing import Callable
+
+import pymupdf
+from docx import Document
+from docx.enum.section import WD_SECTION
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.shared import Inches, Pt
 
 
 LOGGER = logging.getLogger(__name__)
-WD_FORMAT_XML_DOCUMENT = 16
+POINTS_PER_INCH = 72.0
 StatusCallback = Callable[[str], None]
 
 
 class PDFConversionError(Exception):
-    """Base exception for expected conversion failures.
-
-    ``user_message`` is intentionally separate from the technical exception
-    text so the GUI can show a friendly explanation while logging the original
-    details for troubleshooting.
-    """
-
-    def __init__(self, message: str, user_message: str | None = None) -> None:
-        super().__init__(message)
-        self.user_message = user_message or message
+    """Base exception for expected conversion failures."""
 
 
 class PDFValidationError(PDFConversionError):
     """The input or output path is invalid."""
 
 
-class WordNotInstalledError(PDFConversionError):
-    """Microsoft Word or the pywin32 COM bridge could not be started."""
-
-
-class PDFOpenError(PDFConversionError):
-    """Word could not import the PDF."""
-
-
 class OutputExistsError(PDFConversionError):
-    """The requested output already exists and overwrite was not approved."""
-
-
-class OutputError(PDFConversionError):
-    """The converted DOCX could not be written."""
+    """The requested output exists and overwrite was not approved."""
 
 
 class ConversionCancelledError(PDFConversionError):
-    """Conversion was cancelled before Word began opening the PDF."""
+    """Conversion was cancelled before completion."""
 
 
-def _absolute_path(path_value: str | os.PathLike[str], description: str) -> Path:
-    """Return an absolute path and convert path parsing errors to useful errors."""
-
+def _absolute_path(value: str | os.PathLike[str], description: str) -> Path:
     try:
-        return Path(os.path.abspath(os.fspath(path_value)))
+        return Path(os.path.abspath(os.fspath(value)))
     except (TypeError, ValueError, OSError) as exc:
-        raise PDFValidationError(
-            f"Invalid {description} path: {path_value!r}",
-            f"The {description} filename is not valid.",
-        ) from exc
+        raise PDFValidationError(f"Invalid {description} path: {value!r}") from exc
 
 
 def normalise_pdf_path(pdf_path: str | os.PathLike[str]) -> Path:
@@ -78,20 +50,15 @@ def normalise_pdf_path(pdf_path: str | os.PathLike[str]) -> Path:
 
     path = _absolute_path(pdf_path, "PDF")
     if not path.exists() or not path.is_file():
-        raise PDFValidationError(
-            f"PDF does not exist or is not a file: {path}",
-            "The selected PDF file could not be found.",
-        )
+        raise PDFValidationError(f"PDF does not exist or is not a file: {path}")
     if path.suffix.lower() != ".pdf":
-        raise PDFValidationError(
-            f"Input is not a PDF: {path}",
-            "Please select a file with a .pdf extension.",
-        )
+        raise PDFValidationError(f"Input is not a PDF: {path}")
     return path
 
 
 def normalise_output_path(
-    pdf_path: str | os.PathLike[str], output_path: str | os.PathLike[str] | None = None
+    pdf_path: str | os.PathLike[str],
+    output_path: str | os.PathLike[str] | None = None,
 ) -> Path:
     """Return an absolute DOCX path, deriving it from the PDF when omitted."""
 
@@ -103,196 +70,160 @@ def normalise_output_path(
     if path.suffix == "":
         path = path.with_suffix(".docx")
     if path.suffix.lower() != ".docx":
-        raise PDFValidationError(
-            f"Output is not a DOCX path: {path}",
-            "The output filename must have a .docx extension.",
-        )
+        raise PDFValidationError(f"Output is not a DOCX path: {path}")
     return path
 
 
-class WordPDFConverter:
-    """Own one isolated Word COM instance and reuse it for multiple files.
-
-    Instances must be started, used, and closed on the same thread.  The GUI
-    creates this object inside its worker thread so COM initialization and
-    cleanup happen in the correct apartment.
-    """
-
-    def __init__(self, visible: bool = False) -> None:
-        self.visible = visible
-        self._word = None
-        self._pythoncom = None
-        self._com_initialized = False
-
-    def __enter__(self) -> "WordPDFConverter":
-        self.start()
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
-        self.close()
-
-    def start(self) -> None:
-        """Initialize COM and start a private Word instance."""
-
-        if self._word is not None:
-            return
-
-        if platform.system() != "Windows":
-            raise WordNotInstalledError(
-                "Microsoft Word COM automation is only available on Windows.",
-                "This application requires Windows and the desktop version of Microsoft Word.",
-            )
-
-        try:
-            import pythoncom  # type: ignore[import-not-found]
-            import win32com.client  # type: ignore[import-not-found]
-        except ImportError as exc:
-            raise WordNotInstalledError(
-                "pywin32 is not installed; Python could not import the Word COM bridge.",
-                "Microsoft Word could not be started. Please install the application requirements first.",
-            ) from exc
-
-        self._pythoncom = pythoncom
-        try:
-            pythoncom.CoInitialize()
-            self._com_initialized = True
-            self._word = win32com.client.DispatchEx("Word.Application")
-            self._word.Visible = self.visible
-            self._word.DisplayAlerts = 0
-        except Exception as exc:
-            LOGGER.exception("Could not initialize Microsoft Word COM automation.")
-            self.close()
-            raise WordNotInstalledError(
-                f"Could not start Microsoft Word: {exc}",
-                "Microsoft Word could not be started. Please make sure the desktop version of Microsoft Word is installed.",
-            ) from exc
-
-    def convert_pdf(
-        self,
-        pdf_path: str | os.PathLike[str],
-        output_path: str | os.PathLike[str] | None = None,
-        *,
-        overwrite: bool = False,
-        status_callback: StatusCallback | None = None,
-    ) -> str:
-        """Convert one PDF and return the absolute output DOCX path.
-
-        ``overwrite`` must be explicitly enabled by the caller.  The GUI asks
-        for confirmation before starting its worker thread and passes that
-        decision here as a second safety check.
-        """
-
-        pdf = normalise_pdf_path(pdf_path)
-        docx = normalise_output_path(pdf, output_path)
-
-        if docx.exists() and not overwrite:
-            raise OutputExistsError(
-                f"Output already exists: {docx}",
-                f"{docx.name} already exists. Choose a different output filename or approve overwrite.",
-            )
-        if docx.parent and not docx.parent.exists():
-            raise OutputError(
-                f"Output folder does not exist: {docx.parent}",
-                "The Word file could not be saved because the output folder does not exist.",
-            )
-        if docx.exists() and not os.access(docx, os.W_OK):
-            raise OutputError(
-                f"Output is not writable: {docx}",
-                "The Word file could not be saved because the existing file is read-only.",
-            )
-        if not os.access(docx.parent, os.W_OK):
-            raise OutputError(
-                f"Output folder is not writable: {docx.parent}",
-                "The Word file could not be saved. Check your permission to write to this folder.",
-            )
-
-        self.start()
-        doc = None
-        try:
-            self._notify(status_callback, "Opening PDF in Microsoft Word...")
-            try:
-                doc = self._word.Documents.Open(
-                    str(pdf),
-                    ConfirmConversions=False,
-                    ReadOnly=False,
-                    AddToRecentFiles=False,
-                )
-            except Exception as exc:
-                LOGGER.exception("Word could not open PDF: %s", pdf)
-                raise PDFOpenError(
-                    f"Word could not open {pdf}: {exc}",
-                    "Microsoft Word could not open this PDF. The PDF may be corrupted, password-protected, or unsupported.",
-                ) from exc
-
-            self._notify(status_callback, "Converting PDF...")
-            self._notify(status_callback, "Saving Word document...")
-            try:
-                doc.SaveAs2(str(docx), FileFormat=WD_FORMAT_XML_DOCUMENT)
-            except Exception as exc:
-                LOGGER.exception("Word could not save DOCX: %s", docx)
-                raise OutputError(
-                    f"Word could not save {docx}: {exc}",
-                    "The Word file could not be saved. Make sure the output file is not already open and that you have permission to write to this folder.",
-                ) from exc
-
-            return str(docx)
-        finally:
-            if doc is not None:
-                try:
-                    doc.Close(False)
-                except Exception:
-                    LOGGER.exception("Could not close Word document cleanly: %s", pdf)
-                finally:
-                    doc = None
-
-    @staticmethod
-    def _notify(callback: StatusCallback | None, message: str) -> None:
-        if callback is not None:
-            try:
-                callback(message)
-            except Exception:
-                LOGGER.exception("Status callback failed.")
-
-    def close(self) -> None:
-        """Close Word and uninitialize COM, swallowing cleanup-only failures."""
-
-        word = self._word
-        self._word = None
-        try:
-            if word is not None:
-                try:
-                    word.Quit()
-                except Exception:
-                    LOGGER.exception("Could not quit Microsoft Word cleanly.")
-        finally:
-            word = None
-            # Release temporary COM dispatch wrappers before uninitializing
-            # the apartment so WINWORD.EXE does not remain referenced.
-            gc.collect()
-            if self._com_initialized and self._pythoncom is not None:
-                try:
-                    self._pythoncom.CoUninitialize()
-                except Exception:
-                    LOGGER.exception("Could not uninitialize COM cleanly.")
-                finally:
-                    self._com_initialized = False
-                    self._pythoncom = None
+def _configure_section(section, width_in: float, height_in: float) -> None:
+    section.page_width = Inches(width_in)
+    section.page_height = Inches(height_in)
+    section.top_margin = Inches(0)
+    section.bottom_margin = Inches(0)
+    section.left_margin = Inches(0)
+    section.right_margin = Inches(0)
+    section.header_distance = Inches(0)
+    section.footer_distance = Inches(0)
+    section.gutter = Inches(0)
 
 
-def convert_pdf_using_word(
+def _configure_page_paragraph(paragraph) -> None:
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    formatting = paragraph.paragraph_format
+    formatting.space_before = Pt(0)
+    formatting.space_after = Pt(0)
+    formatting.left_indent = Inches(0)
+    formatting.right_indent = Inches(0)
+    formatting.first_line_indent = Inches(0)
+    formatting.line_spacing = 1
+
+
+def convert_pdf_to_docx(
     pdf_path: str | os.PathLike[str],
     output_path: str | os.PathLike[str] | None = None,
-    visible: bool = False,
     *,
+    dpi: int = 300,
     overwrite: bool = False,
     status_callback: StatusCallback | None = None,
-) -> str:
-    """Convenience wrapper for converting one PDF with Word."""
+    cancel_event: Event | None = None,
+) -> Path:
+    """Render a PDF into a visually faithful Word document.
 
-    with WordPDFConverter(visible=visible) as converter:
-        return converter.convert_pdf(
-            pdf_path,
-            output_path,
-            overwrite=overwrite,
-            status_callback=status_callback,
+    Each source page becomes one high-resolution inline image on a matching
+    marginless Word page. The temporary page images are removed automatically.
+    """
+
+    pdf = normalise_pdf_path(pdf_path)
+    docx = normalise_output_path(pdf, output_path)
+
+    if dpi < 72 or dpi > 600:
+        raise PDFValidationError("Rendering DPI must be between 72 and 600.")
+    if docx.exists() and not overwrite:
+        raise OutputExistsError(f"Output already exists: {docx}")
+    if not docx.parent.exists():
+        raise PDFValidationError(f"Output folder does not exist: {docx.parent}")
+    if not os.access(docx.parent, os.W_OK):
+        raise PDFValidationError(f"Output folder is not writable: {docx.parent}")
+
+    if cancel_event and cancel_event.is_set():
+        raise ConversionCancelledError("Conversion cancelled before opening the PDF.")
+
+    pdf_document = pymupdf.open(pdf)
+    try:
+        if pdf_document.page_count == 0:
+            raise PDFValidationError(f"The PDF has no pages: {pdf}")
+
+        word_document = Document()
+        scale = dpi / POINTS_PER_INCH
+        total_pages = pdf_document.page_count
+
+        with TemporaryDirectory(prefix="pdf_to_word_") as temp_dir:
+            temp_root = Path(temp_dir)
+            for page_number, page in enumerate(pdf_document):
+                if cancel_event and cancel_event.is_set():
+                    raise ConversionCancelledError("Conversion cancelled.")
+
+                page_label = f"Rendering page {page_number + 1} of {total_pages}..."
+                if status_callback:
+                    status_callback(page_label)
+
+                width_in = float(page.rect.width) / POINTS_PER_INCH
+                height_in = float(page.rect.height) / POINTS_PER_INCH
+                if page_number == 0:
+                    section = word_document.sections[0]
+                else:
+                    section = word_document.add_section(WD_SECTION.NEW_PAGE)
+                _configure_section(section, width_in, height_in)
+
+                paragraph = word_document.add_paragraph()
+                _configure_page_paragraph(paragraph)
+
+                pixmap = page.get_pixmap(
+                    matrix=pymupdf.Matrix(scale, scale),
+                    alpha=False,
+                    annots=True,
+                )
+                image_path = temp_root / f"page-{page_number + 1:04d}.png"
+                pixmap.save(image_path)
+                paragraph.add_run().add_picture(
+                    str(image_path), width=Inches(width_in), height=Inches(height_in)
+                )
+
+        if cancel_event and cancel_event.is_set():
+            raise ConversionCancelledError("Conversion cancelled before saving.")
+
+        properties = word_document.core_properties
+        properties.title = pdf.stem
+        properties.subject = "High-fidelity PDF to Word conversion"
+        properties.author = ""
+        word_document.save(docx)
+    finally:
+        pdf_document.close()
+
+    if status_callback:
+        status_callback("Conversion complete.")
+    return docx
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Convert a PDF into a visually faithful Word document."
+    )
+    parser.add_argument("input_pdf", type=Path, help="Path to the source PDF")
+    parser.add_argument(
+        "--output",
+        "-o",
+        type=Path,
+        help="Output DOCX path; defaults to the input filename with a .docx suffix",
+    )
+    parser.add_argument(
+        "--dpi",
+        type=int,
+        default=300,
+        help="Rendering resolution in DPI; default: 300",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace an existing DOCX at the output path",
+    )
+    return parser
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    args = build_parser().parse_args()
+    try:
+        output = convert_pdf_to_docx(
+            args.input_pdf,
+            args.output,
+            dpi=args.dpi,
+            overwrite=args.overwrite,
+            status_callback=lambda message: LOGGER.info(message),
         )
+    except PDFConversionError as exc:
+        raise SystemExit(f"Conversion failed: {exc}") from exc
+    print(f"Created {output}")
+
+
+if __name__ == "__main__":
+    main()
