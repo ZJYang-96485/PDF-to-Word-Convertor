@@ -48,7 +48,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 The exact-appearance mode creates a Word page image for each PDF page. The result is visually faithful, but the text and equations are not individually editable.
 
-Uncheck **Preserve exact PDF appearance** only when you need editable Word text. Windows uses Microsoft Word's native PDF importer. On macOS, the app tries Word first and automatically falls back to `pdf2docx` if Word rejects the automated Save As command.
+Uncheck **Preserve exact PDF appearance** only when you need editable Word text. Windows uses Microsoft Word's native PDF importer. On macOS, the app tries Word first and automatically falls back to `pdf2docx` if Word is unavailable or rejects PDF opening, automation, or Save As.
 
 ## LaTeX Workspace
 
@@ -76,4 +76,4 @@ If editable conversion uses Word on macOS, allow Python or Terminal to control M
 
 **System Settings → Privacy & Security → Automation**
 
-If Word reports that it rejected the macOS **Save As** command, the app automatically tries the editable fallback. For the most faithful equations and fonts, keep **Preserve exact PDF appearance** checked; editable conversion cannot recreate the original LaTeX source exactly.
+If Word reports that it rejected the macOS PDF-open or **Save As** command, the app automatically tries the editable fallback. For the most faithful equations and fonts, keep **Preserve exact PDF appearance** checked; editable conversion cannot recreate the original LaTeX source exactly.

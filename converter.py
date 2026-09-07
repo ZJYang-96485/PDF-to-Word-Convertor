@@ -516,7 +516,14 @@ class MacWordConverter:
         """Convert one PDF with Word for Mac and return the absolute DOCX path."""
 
         pdf, docx = _prepare_conversion_paths(pdf_path, output_path, overwrite)
-        self.start()
+        try:
+            self.start()
+        except WordNotInstalledError as exc:
+            LOGGER.warning(
+                "Word for Mac is unavailable; trying editable pdf2docx fallback: %s",
+                exc,
+            )
+            return self._editable_fallback(pdf, docx, status_callback, str(exc))
         self._notify(status_callback, "Opening PDF in Microsoft Word...")
         self._notify(status_callback, "Converting PDF...")
         self._notify(status_callback, "Saving Word document...")
@@ -537,16 +544,10 @@ class MacWordConverter:
             )
         except subprocess.TimeoutExpired as exc:
             LOGGER.exception("Word for Mac automation timed out for %s.", pdf)
-            raise PDFOpenError(
-                f"Word for Mac automation timed out for {pdf}: {exc}",
-                "Microsoft Word took too long to convert this PDF. Complete any Word dialog that is open, then try again with a smaller or simpler PDF.",
-            ) from exc
+            return self._editable_fallback(pdf, docx, status_callback, str(exc))
         except OSError as exc:
             LOGGER.exception("Could not run Word for Mac automation.")
-            raise PDFOpenError(
-                f"Could not run osascript for {pdf}: {exc}",
-                "Microsoft Word could not be controlled. Check that Microsoft Word is installed and allow this app to control it in System Settings > Privacy & Security > Automation.",
-            ) from exc
+            return self._editable_fallback(pdf, docx, status_callback, str(exc))
 
         if result.returncode != 0:
             details = (result.stderr or result.stdout).strip()
@@ -557,35 +558,12 @@ class MacWordConverter:
                     "save as" in error_text
                     and ("doesn't understand" in error_text or "不理解" in error_text)
                 ):
-                    LOGGER.warning(
-                        "Word for Mac rejected AppleScript Save As; trying editable pdf2docx fallback: %s",
-                        details,
-                    )
-                    try:
-                        return Pdf2DocxConverter().convert_pdf(
-                            pdf,
-                            docx,
-                            overwrite=True,
-                            status_callback=status_callback,
-                        )
-                    except PDFConversionError as fallback_exc:
-                        raise OutputError(
-                            f"Word for Mac and the editable fallback could not save {docx}: {fallback_exc}",
-                            "Word for Mac rejected automated Save As, and the editable fallback also failed. Keep Preserve exact PDF appearance enabled for a faithful result, or update Word and try editable mode again.",
-                        ) from fallback_exc
+                    return self._editable_fallback(pdf, docx, status_callback, details)
                 raise OutputError(
                     f"Word for Mac could not save {docx}: {details}",
                     "The Word file could not be saved. Make sure the output file is not already open and that you have permission to write to this folder.",
                 )
-            if "not authorized" in error_text or "not permitted" in error_text or "automation" in error_text:
-                raise PDFOpenError(
-                    f"macOS automation permission was denied: {details}",
-                    "macOS blocked control of Microsoft Word. Allow this application to control Microsoft Word in System Settings > Privacy & Security > Automation, then try again.",
-                )
-            raise PDFOpenError(
-                f"Word for Mac could not open or convert {pdf}: {details}",
-                "Microsoft Word could not open this PDF. The PDF may be corrupted, password-protected, unsupported, or macOS may need permission to control Word.",
-            )
+            return self._editable_fallback(pdf, docx, status_callback, details)
 
         if not docx.exists():
             raise OutputError(
@@ -594,6 +572,36 @@ class MacWordConverter:
             )
 
         return str(docx)
+
+    def _editable_fallback(
+        self,
+        pdf: Path,
+        docx: Path,
+        status_callback: StatusCallback | None,
+        reason: str,
+    ) -> str:
+        """Use pdf2docx after any Microsoft Word for Mac automation failure."""
+
+        LOGGER.warning(
+            "Word for Mac automation failed; trying editable pdf2docx fallback: %s",
+            reason,
+        )
+        self._notify(
+            status_callback,
+            "Word for Mac could not complete PDF import; building editable Word fallback...",
+        )
+        try:
+            return Pdf2DocxConverter().convert_pdf(
+                pdf,
+                docx,
+                overwrite=True,
+                status_callback=status_callback,
+            )
+        except PDFConversionError as fallback_exc:
+            raise OutputError(
+                f"Word for Mac and the editable fallback could not convert {pdf}: {fallback_exc}",
+                "Word for Mac could not import this PDF, and the editable fallback also failed. Keep Preserve exact PDF appearance enabled for a faithful result, or install the project requirements and try again.",
+            ) from fallback_exc
 
     @staticmethod
     def _notify(callback: StatusCallback | None, message: str) -> None:

@@ -411,7 +411,12 @@ class PDFConverterApp:
                 if visual_mode
                 else create_word_converter(visible=False)
             )
-            converter.start()
+            # MacWordConverter starts lazily inside convert_pdf so it can
+            # fall back to pdf2docx when Word is unavailable or rejects PDF
+            # automation. Windows COM and exact-appearance conversion still
+            # initialize explicitly here.
+            if not isinstance(converter, MacWordConverter):
+                converter.start()
             for job_index, job in enumerate(jobs):
                 if self.cancel_event.is_set():
                     cancelled = True
