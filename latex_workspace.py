@@ -185,6 +185,7 @@ _TEX4HT_STANDALONE_ALIGNMENT_RE = re.compile(
 )
 _TEX4HT_INLINE_DOLLAR_RE = re.compile(r"(?<!\$)\$(?!\$)([^$\n]+?)\$(?!\$)")
 _BOX_MARKER_RE = re.compile(r"PDFBox[SE]\d{3}")
+_EQUALITY_MARKER_RE = re.compile(r"PDFEq\d{3}")
 
 
 def _mark_boxed_math(source: str) -> str:
@@ -246,12 +247,26 @@ def _tex4ht_source(source: str) -> str:
     preview remain unchanged.
     """
 
+    equality_marker_number = 1
+
     def rows(body: str) -> list[str]:
-        return [
-            row.replace("&", "").strip()
-            for row in re.split(r"\\\\(?:\s*\[[^]]*\])?", body)
-            if row.strip()
-        ]
+        nonlocal equality_marker_number
+        cleaned_rows: list[str] = []
+        for row in re.split(r"\\\\(?:\s*\[[^]]*\])?", body):
+            cleaned = row.replace("&", "").strip()
+            if not cleaned:
+                continue
+            # TeX4ht treats an equals sign at the very start of a standalone
+            # equation as alignment metadata and can drop it during the ODT
+            # conversion.  Put a temporary text marker before it so the
+            # equality is no longer the first token; the marker is removed
+            # after LibreOffice creates the editable Word math.
+            if cleaned.startswith("="):
+                marker = f"PDFEq{equality_marker_number:03d}"
+                equality_marker_number += 1
+                cleaned = rf"\text{{{marker}}}\mathrel{{=}}" + cleaned[1:]
+            cleaned_rows.append(cleaned)
+        return cleaned_rows
 
     def replace_display_alignment(match: re.Match[str]) -> str:
         return "\n".join(
@@ -460,6 +475,7 @@ class LatexSourceDocxConverter:
         self._clean_header(document)
         self._restore_question_points(document)
         self._clean_leaked_part_points(document)
+        self._restore_leading_equals(document)
         self._restore_boxed_equations(document)
         self._restore_list_labels(document)
         self._restore_solution_frames(document)
@@ -557,6 +573,34 @@ class LatexSourceDocxConverter:
             match = leaked.fullmatch(paragraph.text.strip())
             if match:
                 paragraph.text = f"({match.group(1)})"
+
+    @staticmethod
+    def _restore_leading_equals(document: object) -> None:
+        """Remove temporary equality markers while preserving the equals sign."""
+
+        math_namespace = "{http://schemas.openxmlformats.org/officeDocument/2006/math}"
+        text_tag = math_namespace + "t"
+        math_tag = math_namespace + "oMath"
+        run_tag = math_namespace + "r"
+        run_properties_tag = math_namespace + "rPr"
+        for paragraph in document.paragraphs:  # type: ignore[attr-defined]
+            for formula in paragraph._p.iter(math_tag):
+                changed = False
+                for node in formula.iter(text_tag):
+                    if node.text and _EQUALITY_MARKER_RE.search(node.text):
+                        node.text = _EQUALITY_MARKER_RE.sub("", node.text)
+                        changed = True
+                if not changed:
+                    continue
+                # LibreOffice preserves the temporary marker as an empty
+                # math run after its text is removed.  Delete that run too;
+                # otherwise Word shows an editable dotted placeholder.
+                for run in list(formula.iter(run_tag)):
+                    content = [child for child in run if child.tag != run_properties_tag]
+                    if not any(child.tag == text_tag and (child.text or "") for child in content):
+                        parent = run.getparent()
+                        if parent is not None:
+                            parent.remove(run)
 
     def _restore_boxed_equations(self, document: object) -> None:
         """Convert temporary markers into native OMML border boxes."""
