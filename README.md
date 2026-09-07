@@ -6,7 +6,7 @@ Convert PDFs to Word documents while preserving LaTeX, equations, fonts, diagram
 
 - Python 3.10 or newer
 - Tkinter
-- Microsoft Word only if editable Word conversion is needed
+- Microsoft Word for the native editable mode on Windows; macOS can use the editable fallback
 
 ## macOS setup
 
@@ -49,12 +49,12 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 The exact-appearance mode creates a Word page image for each PDF page. The result is visually faithful, but the text and equations are not individually editable.
 
-Uncheck **Preserve exact PDF appearance** only when you need editable Word text. This mode uses Microsoft Word's native PDF importer and requires the desktop version of Word.
+Uncheck **Preserve exact PDF appearance** only when you need editable Word text. Windows uses Microsoft Word's native PDF importer. On macOS, the app tries Word first and automatically falls back to `pdf2docx` if Word rejects the automated Save As command.
 
 ## macOS Word permission
 
-If editable conversion is used on macOS, allow Python or Terminal to control Microsoft Word under:
+If editable conversion uses Word on macOS, allow Python or Terminal to control Microsoft Word under:
 
 **System Settings → Privacy & Security → Automation**
 
-If Word reports that it rejected the macOS **Save As** command, keep **Preserve exact PDF appearance** checked. That mode avoids Word automation and is recommended for equation-heavy PDFs.
+If Word reports that it rejected the macOS **Save As** command, the app automatically tries the editable fallback. For the most faithful equations and fonts, keep **Preserve exact PDF appearance** checked; editable conversion cannot recreate the original LaTeX source exactly.

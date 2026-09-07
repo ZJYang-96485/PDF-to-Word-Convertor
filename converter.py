@@ -307,7 +307,10 @@ _MAC_CONVERSION_SCRIPT = r'''on run argv
         set display alerts to alerts none
         try
             try
-                open (POSIX file (my inputPath))
+                set openedDocument to open (POSIX file (my inputPath))
+                if openedDocument is not missing value then
+                    set sourceDoc to openedDocument
+                end if
             on error errMsg number errNum
                 error ("PDF_OPEN|" & errMsg) number errNum
             end try
@@ -319,14 +322,16 @@ _MAC_CONVERSION_SCRIPT = r'''on run argv
                     end if
                     delay 0.5
                 end repeat
-                set sourceDoc to active document
+                if sourceDoc is missing value then
+                    set sourceDoc to active document
+                end if
             on error errMsg number errNum
                 error ("PDF_OPEN|" & errMsg) number errNum
             end try
 
             try
-                set outputFile to (POSIX file (my outputPath)) as text
-                save as active document file name outputFile file format format document
+                set outputFile to POSIX file (my outputPath)
+                save as sourceDoc file name outputFile file format format document
             on error errMsg number errNum
                 try
                     close (my sourceDoc) saving no
@@ -356,6 +361,68 @@ _MAC_QUIT_IF_IDLE_SCRIPT = r'''tell application id "com.microsoft.Word"
     if (count of documents) is 0 then quit
 end tell'''
 MAC_AUTOMATION_TIMEOUT_SECONDS = 15 * 60
+
+
+class Pdf2DocxConverter:
+    """Editable PDF-to-DOCX fallback that does not use Word automation.
+
+    This backend reconstructs editable Word text and positioned objects from
+    the PDF. It is used when a Word for Mac installation rejects AppleScript's
+    Save As command. It cannot recreate the original LaTeX source or guarantee
+    pixel-perfect typography; ``VisualFidelityConverter`` remains the exact
+    appearance option.
+    """
+
+    def start(self) -> None:
+        return None
+
+    def convert_pdf(
+        self,
+        pdf_path: str | os.PathLike[str],
+        output_path: str | os.PathLike[str] | None = None,
+        *,
+        overwrite: bool = False,
+        status_callback: StatusCallback | None = None,
+    ) -> str:
+        pdf, docx = _prepare_conversion_paths(pdf_path, output_path, overwrite)
+        try:
+            from pdf2docx import Converter as PDF2DOCXConverter  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise ConversionDependencyError(
+                "pdf2docx is required for the editable fallback.",
+                "The editable fallback needs pdf2docx. Run `pip install -r requirements.txt`, then try again.",
+            ) from exc
+
+        self._notify(status_callback, "Building editable Word document...")
+        converter = PDF2DOCXConverter(str(pdf))
+        try:
+            converter.convert(str(docx), start=0, end=None)
+        except Exception as exc:
+            LOGGER.exception("pdf2docx could not convert %s", pdf)
+            raise OutputError(
+                f"pdf2docx could not convert {pdf}: {exc}",
+                "The editable PDF conversion failed. Try the exact-appearance mode for a visually faithful result.",
+            ) from exc
+        finally:
+            converter.close()
+
+        if not docx.exists():
+            raise OutputError(
+                f"pdf2docx reported success but the output was not found: {docx}",
+                "The editable Word file could not be found after conversion.",
+            )
+        return str(docx)
+
+    @staticmethod
+    def _notify(callback: StatusCallback | None, message: str) -> None:
+        if callback is not None:
+            try:
+                callback(message)
+            except Exception:
+                LOGGER.exception("Status callback failed.")
+
+    def close(self) -> None:
+        return None
 
 
 class MacWordConverter:
@@ -490,10 +557,22 @@ class MacWordConverter:
                     "save as" in error_text
                     and ("doesn't understand" in error_text or "不理解" in error_text)
                 ):
-                    raise OutputError(
-                        f"Word for Mac does not expose Save As through AppleScript for {docx}: {details}",
-                        "Word opened the PDF, but this installed version of Word for Mac rejected the Save As command used by macOS automation. This is a Word/AppleScript compatibility issue, not necessarily a folder-permission problem. Update Word and try again; if it persists, open the PDF in Word and choose File > Save As > Word Document (.docx).",
+                    LOGGER.warning(
+                        "Word for Mac rejected AppleScript Save As; trying editable pdf2docx fallback: %s",
+                        details,
                     )
+                    try:
+                        return Pdf2DocxConverter().convert_pdf(
+                            pdf,
+                            docx,
+                            overwrite=True,
+                            status_callback=status_callback,
+                        )
+                    except PDFConversionError as fallback_exc:
+                        raise OutputError(
+                            f"Word for Mac and the editable fallback could not save {docx}: {fallback_exc}",
+                            "Word for Mac rejected automated Save As, and the editable fallback also failed. Keep Preserve exact PDF appearance enabled for a faithful result, or update Word and try editable mode again.",
+                        ) from fallback_exc
                 raise OutputError(
                     f"Word for Mac could not save {docx}: {details}",
                     "The Word file could not be saved. Make sure the output file is not already open and that you have permission to write to this folder.",
