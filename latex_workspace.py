@@ -347,10 +347,11 @@ _TEX4HT_DISPLAY_ALIGNMENT_RE = re.compile(
     re.DOTALL,
 )
 _TEX4HT_STANDALONE_ALIGNMENT_RE = re.compile(
-    r"\\begin\{(align\*|eqnarray\*)\}(.*?)\\end\{\1\}",
+    r"\\begin\{(align\*|eqnarray\*|gather\*)\}(.*?)\\end\{\1\}",
     re.DOTALL,
 )
 _TEX4HT_INLINE_DOLLAR_RE = re.compile(r"(?<!\$)\$(?!\$)([^$\n]+?)\$(?!\$)")
+_TEX_ENV_TOKEN_RE = re.compile(r"\\(begin|end)\s*\{(parts|solution)\}")
 _BOX_MARKER_RE = re.compile(r"PDFBox[SE]\d{3}")
 _EQUALITY_MARKER_RE = re.compile(r"PDFEq\d{3}")
 
@@ -401,6 +402,58 @@ def _mark_boxed_math(source: str) -> str:
     return "".join(output)
 
 
+def _flatten_nested_exam_solutions(source: str) -> str:
+    """Keep solutions nested in ``exam`` parts visible in TeX4ht output.
+
+    TeX4ht's ODT backend can drop an ``exam`` solution when it occurs inside
+    the outer ``parts`` list.  For the Word-export copy only, flatten that
+    solution into ordinary editable text, equations, and lists while keeping
+    it in source order; this avoids the malformed nested ODT list.  The
+    user's source and normal PDF compilation are not changed.
+    """
+
+    solution_block = re.compile(
+        r"\\begin\s*\{solution\}(.*?)\\end\s*\{solution\}",
+        re.DOTALL,
+    )
+    output: list[str] = []
+    cursor = 0
+    parts_depth = 0
+
+    def update_parts_depth(fragment: str) -> None:
+        nonlocal parts_depth
+        for token in _TEX_ENV_TOKEN_RE.finditer(fragment):
+            kind, environment = token.groups()
+            if environment != "parts":
+                continue
+            parts_depth += 1 if kind == "begin" else -1
+            parts_depth = max(0, parts_depth)
+
+    for match in solution_block.finditer(source):
+        prefix = source[cursor : match.start()]
+        output.append(prefix)
+        update_parts_depth(prefix)
+
+        if parts_depth == 0:
+            output.append(match.group(0))
+        else:
+            body = match.group(1)
+            body = body.replace(
+                r"\begin{parts}", r"\begin{enumerate}[label=(\alph*)]"
+            )
+            body = body.replace(r"\end{parts}", r"\end{enumerate}")
+            body = re.sub(
+                r"\\part(?:\s*\[[^]]*\])?",
+                lambda _match: r"\item",
+                body,
+            )
+            output.append(r"\par\noindent\textbf{Solution:}\par" + body + r"\par")
+            update_parts_depth(match.group(0))
+        cursor = match.end()
+    output.append(source[cursor:])
+    return "".join(output)
+
+
 def _tex4ht_source(source: str) -> str:
     """Make alignment-heavy math safe for TeX4ht's ODT backend.
 
@@ -445,7 +498,13 @@ def _tex4ht_source(source: str) -> str:
             f"\\begin{{equation*}}\n{row}\n\\end{{equation*}}" for row in rows(match.group(2))
         )
 
+    source = _flatten_nested_exam_solutions(source)
     source = _mark_boxed_math(source)
+    # TeX4ht's MathML writer can emit malformed fragments for thin-space
+    # commands inside long ``\mathrm`` subscripts.  Ordinary TeX spaces keep
+    # the same visible wording and produce a valid editable Word formula.
+    source = source.replace(r"\mathrm{out\,of\,engine}", r"{out\ of\ engine}")
+    source = source.replace(r"\mathrm{in\,to\,engine}", r"{in\ to\ engine}")
     source = _TEX4HT_DISPLAY_ALIGNMENT_RE.sub(replace_display_alignment, source)
     source = _TEX4HT_STANDALONE_ALIGNMENT_RE.sub(replace_standalone_alignment, source)
     if r"\begin{enumerate}" in source and r"\labelenumi" not in source:
@@ -502,6 +561,83 @@ def _filter_resolved_reference_warnings(log: str, aux_path: Path) -> str:
     return "\n".join(filtered)
 
 
+def _repair_odt_content_xml(data: bytes, etree: object) -> bytes:
+    """Repair malformed list boundaries emitted by TeX4ht's ODT backend."""
+
+    try:
+        etree.fromstring(data)
+        return data
+    except etree.XMLSyntaxError:
+        pass
+
+    # TeX4ht can emit a pair of stray paragraph tags around a gather/aligned
+    # display.  Removing them exposes the intended list boundaries.
+    repaired = re.sub(
+        rb"\s*</text:p>\s*<text:p\b[^>]*></mtable>\s*</text:p>",
+        b"",
+        data,
+    )
+
+    # A gathered display can leave raw MathML closing tags inside the next
+    # display paragraph.  Close that paragraph before the following one so
+    # the later question/list content remains inside office:text.
+    stray_math = re.compile(
+        rb"(</draw:frame>)(?:(?!<text:p\b).)*?(?=<text:p\b)",
+        re.DOTALL,
+    )
+
+    def close_stray_math(match: re.Match[bytes]) -> bytes:
+        block = match.group(0)
+        if any(marker in block for marker in (b"</mrow", b"</msub", b"<mi")):
+            return match.group(1) + b"</text:p>\n"
+        return block
+
+    repaired = stray_math.sub(close_stray_math, repaired)
+
+    # When a solution is nested in an exam parts list, TeX4ht leaves the
+    # following question as raw text between list tags.  Put that text back
+    # into a paragraph and close the stale outer list before it.
+    orphan_text = re.compile(
+        rb"(</text:list>)\s+(?=[^<\s])(.*?)(?=<text:list\b)",
+        re.DOTALL,
+    )
+    repaired, orphan_count = orphan_text.subn(
+        lambda match: (
+            match.group(1)
+            + b"\n</text:list-item></text:list>\n"
+            + b'<text:p text:style-name="Text-body">'
+            + match.group(2)
+            + b"</text:p>\n"
+        ),
+        repaired,
+    )
+
+    try:
+        etree.fromstring(repaired)
+        return repaired
+    except etree.XMLSyntaxError:
+        if orphan_count:
+            closing = b"</text:list-item></text:list>\n"
+            office_text = b"</office:text>"
+            position = repaired.rfind(office_text)
+            if position >= 0:
+                closed = repaired[:position] + closing + repaired[position:]
+                try:
+                    etree.fromstring(closed)
+                    return closed
+                except etree.XMLSyntaxError:
+                    repaired = closed
+
+    parser = etree.XMLParser(recover=True, huge_tree=True)
+    root = etree.fromstring(repaired, parser)
+    if root is None:
+        raise LatexWorkspaceError(
+            "TeX4ht produced an unrecoverable content.xml file.",
+            "The editable Word export could not repair the intermediate document structure.",
+        )
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+
 def _repair_odt_manifest(odt_path: Path) -> Path:
     """Repair TeX4ht ODT metadata/XML before LibreOffice imports it.
 
@@ -533,22 +669,7 @@ def _repair_odt_manifest(odt_path: Path) -> Path:
                 manifest = manifest.replace(r"\image:mimebmp ", "image/bmp")
                 data = manifest.encode("utf-8")
             elif item.filename == "content.xml":
-                try:
-                    etree.fromstring(data)
-                except etree.XMLSyntaxError:
-                    parser = etree.XMLParser(recover=True, huge_tree=True)
-                    root = etree.fromstring(data, parser)
-                    if root is None:
-                        raise LatexWorkspaceError(
-                            "TeX4ht produced an unrecoverable content.xml file.",
-                            "The editable Word export could not repair the intermediate document structure.",
-                        )
-                    data = etree.tostring(
-                        root,
-                        xml_declaration=True,
-                        encoding="UTF-8",
-                        standalone=True,
-                    )
+                data = _repair_odt_content_xml(data, etree)
             destination.writestr(item, data)
     return repaired
 
@@ -700,6 +821,7 @@ class LatexSourceDocxConverter:
         self._clean_header(document)
         self._restore_question_points(document)
         self._clean_leaked_part_points(document)
+        self._restore_part_points(document)
         self._restore_leading_equals(document)
         self._restore_boxed_equations(document)
         self._restore_list_labels(document)
@@ -777,17 +899,82 @@ class LatexSourceDocxConverter:
                     right.set(qn("w:space"), "0")
                     right.set(qn("w:color"), "000000")
 
-    def _restore_question_points(self, document: object) -> None:
-        """Restore exam point totals that TeX4ht drops from question labels."""
+    @staticmethod
+    def _normalise_question_text(text: str) -> str:
+        text = re.sub(r"(?m)%.*$", " ", text)
+        text = re.sub(r"\\(?:ref|autoref|pageref)\s*\{[^}]*\}", " ", text)
+        text = re.sub(r"\$\$.*?\$\$|\$.*?\$", " ", text, flags=re.DOTALL)
+        text = re.sub(r"\\[A-Za-z@]+\*?(?:\s*\[[^]]*\])?", " ", text)
+        text = re.sub(r"[{}]", " ", text)
+        return " ".join(text.split())
 
-        points = re.findall(r"\\question\s*\[(\d+)\]", self.source_text)
-        question_paragraphs = [
-            paragraph
-            for paragraph in document.paragraphs  # type: ignore[attr-defined]
-            if re.fullmatch(r"\d+\.", paragraph.text.strip())
-        ]
-        for paragraph, value in zip(question_paragraphs, points):
-            paragraph.text = f"{paragraph.text.strip()} [{value} points]"
+    def _question_specs(self) -> list[tuple[str | None, str]]:
+        matches = list(re.finditer(r"\\question\s*(?:\[(\d+)\])?", self.source_text))
+        specs: list[tuple[str | None, str]] = []
+        for index, match in enumerate(matches):
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(self.source_text)
+            body = self.source_text[match.end() : end]
+            lead = self._normalise_question_text(body)
+            specs.append((match.group(1), " ".join(lead.split()[:8])))
+        return specs
+
+    def _restore_question_points(self, document: object) -> None:
+        """Restore question totals and missing question labels from source order."""
+
+        paragraphs = list(document.paragraphs)  # type: ignore[attr-defined]
+        specs = self._question_specs()
+        for question_number, (points, lead) in enumerate(specs, start=1):
+            if not lead:
+                continue
+            candidate_index = next(
+                (
+                    index
+                    for index, paragraph in enumerate(paragraphs)
+                    if self._normalise_question_text(paragraph.text).startswith(lead)
+                ),
+                None,
+            )
+            if candidate_index is None:
+                continue
+
+            label_index = next(
+                (
+                    index
+                    for index in range(candidate_index - 1, -1, -1)
+                    if re.fullmatch(r"\d+\.", paragraphs[index].text.strip())
+                ),
+                None,
+            )
+            label = f"{question_number}."
+            if points:
+                label += f" [{points} points]"
+            if label_index is None:
+                marker = (
+                    paragraphs[candidate_index - 1]
+                    if candidate_index > 0
+                    else None
+                )
+                if (
+                    marker is not None
+                    and marker.style
+                    and marker.style.name == "Inside-enumerate"
+                    and not marker.text.strip()
+                ):
+                    self._delete_paragraph(marker)
+                    paragraphs.remove(marker)
+                    candidate_index -= 1
+                paragraph = paragraphs[candidate_index].insert_paragraph_before(label)
+                paragraph.style = document.styles["dt"]  # type: ignore[attr-defined]
+                for run in paragraph.runs:
+                    run.bold = True
+                paragraphs.insert(candidate_index, paragraph)
+                continue
+
+            paragraph = paragraphs[label_index]
+            paragraph.text = label
+            paragraph.style = document.styles["dt"]  # type: ignore[attr-defined]
+            for run in paragraph.runs:
+                run.bold = True
 
     @staticmethod
     def _clean_leaked_part_points(document: object) -> None:
@@ -798,6 +985,42 @@ class LatexSourceDocxConverter:
             match = leaked.fullmatch(paragraph.text.strip())
             if match:
                 paragraph.text = f"({match.group(1)})"
+
+    def _source_question_part_points(self) -> list[str | None]:
+        token_re = re.compile(
+            r"\\begin\s*\{solution\}|\\end\s*\{solution\}"
+            r"|\\part\s*(?:\[(\d+)\])?"
+        )
+        solution_depth = 0
+        points: list[str | None] = []
+        for match in token_re.finditer(self.source_text):
+            token = match.group(0)
+            if token.startswith(r"\begin"):
+                solution_depth += 1
+            elif token.startswith(r"\end"):
+                solution_depth = max(0, solution_depth - 1)
+            elif solution_depth == 0:
+                points.append(match.group(1))
+        return points
+
+    def _restore_part_points(self, document: object) -> None:
+        """Restore point totals on top-level exam parts."""
+
+        points = self._source_question_part_points()
+        part_paragraphs = [
+            paragraph
+            for paragraph in document.paragraphs  # type: ignore[attr-defined]
+            if re.fullmatch(r"(?:\[\d+ points\])?\([a-z]\)", paragraph.text.strip())
+        ]
+        for paragraph, value in zip(part_paragraphs, points):
+            if not value:
+                continue
+            label = re.search(r"\([a-z]\)", paragraph.text.strip())
+            if label is None:
+                continue
+            paragraph.text = f"{label.group(0)} [{value} points]"
+            for run in paragraph.runs:
+                run.bold = True
 
     @staticmethod
     def _restore_leading_equals(document: object) -> None:
@@ -878,12 +1101,112 @@ class LatexSourceDocxConverter:
                 formula.insert(start_index, border_box)
 
     @staticmethod
-    def _restore_list_labels(document: object) -> None:
+    def _alpha_label(number: int) -> str:
+        value = ""
+        while number:
+            number, remainder = divmod(number - 1, 26)
+            value = chr(ord("a") + remainder) + value
+        return f"({value})"
+
+    @staticmethod
+    def _roman_label(number: int) -> str:
+        values = (
+            (1000, "M"),
+            (900, "CM"),
+            (500, "D"),
+            (400, "CD"),
+            (100, "C"),
+            (90, "XC"),
+            (50, "L"),
+            (40, "XL"),
+            (10, "X"),
+            (9, "IX"),
+            (5, "V"),
+            (4, "IV"),
+            (1, "I"),
+        )
+        value = ""
+        for amount, symbol in values:
+            count, number = divmod(number, amount)
+            value += symbol * count
+        return f"({value})"
+
+    def _source_list_labels(self) -> list[str]:
+        """Return editable labels for TeX list items in source order."""
+
+        token_re = re.compile(
+            r"\\begin\s*\{(enumerate|parts|solution)\}\s*(?:\[([^]]*)\])?"
+            r"|\\end\s*\{(enumerate|parts|solution)\}"
+            r"|\\(item|part)\b",
+            re.DOTALL,
+        )
+        stack: list[tuple[str, str]] = []
+        solution_depth = 0
+        solution_nested_in_parts: list[bool] = []
+        labels: list[str] = []
+        counters: list[int] = []
+        for match in token_re.finditer(self.source_text):
+            begin_environment, options, end_environment, item_kind = match.groups()
+            if begin_environment:
+                if begin_environment == "solution":
+                    solution_depth += 1
+                    solution_nested_in_parts.append(any(name == "parts" for name, _ in stack))
+                    continue
+                if begin_environment == "parts":
+                    stack.append((begin_environment, "alpha"))
+                else:
+                    option_text = options or ""
+                    if "Roman" in option_text:
+                        style = "roman"
+                    elif "alph" in option_text or "alpha" in option_text:
+                        style = "alpha"
+                    else:
+                        style = "arabic"
+                    stack.append((begin_environment, style))
+                counters.append(0)
+                continue
+            if end_environment:
+                if end_environment == "solution":
+                    solution_depth = max(0, solution_depth - 1)
+                    if solution_nested_in_parts:
+                        solution_nested_in_parts.pop()
+                elif stack:
+                    stack.pop()
+                    counters.pop()
+                continue
+            if not stack or not counters:
+                continue
+            environment, style = stack[-1]
+            if item_kind == "part":
+                if (
+                    environment != "parts"
+                    or solution_depth == 0
+                    or not solution_nested_in_parts[-1]
+                ):
+                    continue
+            elif item_kind == "item":
+                if environment != "enumerate":
+                    continue
+            else:
+                continue
+            counters[-1] += 1
+            number = counters[-1]
+            if style == "roman":
+                labels.append(self._roman_label(number))
+            elif style == "alpha":
+                labels.append(self._alpha_label(number))
+            else:
+                labels.append(f"{number}.")
+        return labels
+
+    def _restore_list_labels(self, document: object) -> None:
         """Replace TeX4ht's presentation-only list labels with Word text."""
 
         from docx.oxml.ns import qn  # type: ignore[import-not-found]
         from docx.shared import Inches  # type: ignore[import-not-found]
 
+        source_labels = self._source_list_labels()
+        label_index = 0
         number = 0
         in_list = False
         for paragraph in document.paragraphs:  # type: ignore[attr-defined]
@@ -903,7 +1226,12 @@ class LatexSourceDocxConverter:
                     properties.remove(numbering)
             paragraph.paragraph_format.left_indent = Inches(0.45)
             paragraph.paragraph_format.first_line_indent = Inches(-0.2)
-            prefix_run = paragraph.add_run(f"{number}. ")
+            if label_index < len(source_labels):
+                label = source_labels[label_index]
+            else:
+                label = f"{number}."
+            label_index += 1
+            prefix_run = paragraph.add_run(f"{label} ")
             prefix_element = prefix_run._r
             prefix_element.getparent().remove(prefix_element)
             insert_at = 1 if paragraph._p.pPr is not None else 0
@@ -944,20 +1272,65 @@ class LatexSourceDocxConverter:
                 margin.set(qn("w:type"), "dxa")
 
     def _restore_solution_frames(self, document: object) -> None:
-        """Frame each exam ``solution`` environment in an editable table cell."""
+        """Keep TeX4ht's solution paragraphs inside their editable frame."""
 
+        from docx.table import Table  # type: ignore[import-not-found]
+        from docx.text.paragraph import Paragraph  # type: ignore[import-not-found]
+
+        body = document._body._body  # type: ignore[attr-defined]
+        body_children = list(body.iterchildren())
+        solution_tables: list[object] = []
+        for child in body_children:
+            if not child.tag.endswith("}tbl"):
+                continue
+            table = Table(child, document)
+            cells = [cell for row in table.rows for cell in row.cells]
+            if any(
+                any(paragraph.text.strip().startswith("Solution:") for paragraph in cell.paragraphs)
+                for cell in cells
+            ):
+                solution_tables.append(table)
+
+        for table in solution_tables:
+            cell = next(
+                (
+                    cell
+                    for row in table.rows
+                    for cell in row.cells
+                    if any(paragraph.text.strip().startswith("Solution:") for paragraph in cell.paragraphs)
+                ),
+                None,
+            )
+            if cell is None:
+                continue
+            body_children = list(body.iterchildren())
+            current_index = body_children.index(table._tbl)  # type: ignore[attr-defined]
+            moved: list[object] = []
+            for child in body_children[current_index + 1 :]:
+                if child.tag.endswith("}p"):
+                    paragraph = Paragraph(child, document)
+                    if re.fullmatch(r"\d+\.\s*\[\d+ points\]", paragraph.text.strip()):
+                        break
+                    moved.append(child)
+                elif child.tag.endswith("}tbl"):
+                    break
+            for child in moved:
+                cell._tc.append(child)
+
+        # If LibreOffice received the repaired ODT without solution tables,
+        # create the frames from the source-level solution boundaries.  The
+        # question label restored above is the reliable end marker; numeric
+        # list labels are not boundaries because solution parts can use them.
         paragraphs = list(document.paragraphs)  # type: ignore[attr-defined]
         starts = [
             index
             for index, paragraph in enumerate(paragraphs)
             if paragraph.text.strip().startswith("Solution:")
         ]
-        # Work backwards so moving one solution into a table does not disturb
-        # the paragraph elements needed to locate earlier solutions.
         for start in reversed(starts):
             end = len(paragraphs)
             for index in range(start + 1, len(paragraphs)):
-                if re.fullmatch(r"\d+\.\s*(?:\[\d+ points\])?", paragraphs[index].text.strip()):
+                if re.fullmatch(r"\d+\.\s*\[\d+ points\]", paragraphs[index].text.strip()):
                     end = index
                     break
             if end <= start:
@@ -971,6 +1344,7 @@ class LatexSourceDocxConverter:
             cell = table.cell(0, 0)
             for index in range(start, end):
                 cell._tc.append(paragraphs[index]._p)
+
 
     @staticmethod
     def _add_page_numbers(document: object) -> None:
