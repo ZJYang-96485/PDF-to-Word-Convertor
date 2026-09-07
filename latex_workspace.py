@@ -446,6 +446,33 @@ def _tool_path(names: tuple[str, ...], extra_paths: tuple[str, ...] = ()) -> str
     return None
 
 
+def _filter_resolved_reference_warnings(log: str, aux_path: Path) -> str:
+    """Hide first-pass cross-reference warnings resolved by the final pass."""
+
+    if not aux_path.is_file():
+        return log
+    try:
+        aux = aux_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return log
+    resolved = set(re.findall(r"\\newlabel\{([^}]+)\}", aux))
+    if not resolved:
+        return log
+
+    reference_warning = re.compile(r"Reference [`']([^`']+)[`'] .*undefined")
+    filtered: list[str] = []
+    removed_reference_warning = False
+    for line in log.splitlines():
+        match = reference_warning.search(line)
+        if match and match.group(1) in resolved:
+            removed_reference_warning = True
+            continue
+        filtered.append(line)
+    if removed_reference_warning and not any(reference_warning.search(line) for line in filtered):
+        filtered = [line for line in filtered if "There were undefined references." not in line]
+    return "\n".join(filtered)
+
+
 def _repair_odt_manifest(odt_path: Path) -> Path:
     """Repair TeX4ht ODT metadata/XML before LibreOffice imports it.
 
@@ -1116,6 +1143,8 @@ def compile_latex(
 
     pdf_path = build_dir / Path(main_name).with_suffix(".pdf").name
     log = "\n".join(part for part in log_parts if part)
+    if first.returncode == 0 and pdf_path.is_file():
+        log = _filter_resolved_reference_warnings(log, build_dir / Path(main_name).with_suffix(".aux").name)
     if first.returncode != 0 or not pdf_path.is_file():
         raise LatexWorkspaceError(
             f"LaTeX compilation failed for {tex_path}:\n{log}",
