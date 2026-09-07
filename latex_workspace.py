@@ -101,6 +101,35 @@ def _find_graphic(source_dir: Path, requested_name: str) -> Path | None:
     return None
 
 
+def _reference_name_tokens(path: Path) -> set[str]:
+    """Normalize a TeX/PDF filename for conservative project matching."""
+
+    return set(re.findall(r"[a-z0-9]+", path.stem.lower()))
+
+
+def _find_reference_pdf(tex_path: Path) -> Path | None:
+    """Find the most likely matching reference PDF beside a source file."""
+
+    exact = tex_path.with_suffix(".pdf")
+    if exact.is_file():
+        return exact
+
+    source_tokens = _reference_name_tokens(tex_path)
+    if not source_tokens:
+        return None
+    candidates: list[tuple[int, Path]] = []
+    for candidate in sorted(tex_path.parent.glob("*.pdf")):
+        overlap = len(source_tokens & _reference_name_tokens(candidate))
+        if overlap >= 2:
+            candidates.append((overlap, candidate))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (-item[0], item[1].name.lower()))
+    best_score = candidates[0][0]
+    best = [candidate for score, candidate in candidates if score == best_score]
+    return best[0] if len(best) == 1 else None
+
+
 def _copy_existing_graphics(source_dir: Path, build_dir: Path, source: str) -> None:
     for requested_name in _graphics_names(source):
         existing = _find_graphic(source_dir, requested_name)
@@ -1292,8 +1321,7 @@ class LatexWorkspaceApp:
         self.editor.delete("1.0", "end")
         self.editor.insert("1.0", source)
         self.last_compiled_text = ""
-        candidate_pdf = self.tex_path.with_suffix(".pdf")
-        self.reference_pdf = candidate_pdf if candidate_pdf.is_file() else None
+        self.reference_pdf = _find_reference_pdf(self.tex_path)
         self.path_var.set(str(self.tex_path))
         self.reference_var.set(
             f"Reference PDF: {self.reference_pdf.name}" if self.reference_pdf else "Reference PDF: automatic"
