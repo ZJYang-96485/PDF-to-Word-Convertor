@@ -1,6 +1,6 @@
 # PDF to Word Converter
 
-A small Windows and macOS desktop application that converts PDF files to editable Microsoft Word `.docx` documents through Microsoft Word's own PDF conversion engine.
+A Windows and macOS desktop application that converts PDF files to Word `.docx` documents. Exact page-preserving conversion is enabled by default; editable Microsoft Word conversion is available as an opt-in mode.
 
 ## Requirements
 
@@ -37,7 +37,7 @@ python app.py
 
 Select a PDF, adjust the output filename if needed, and click **Convert to Word**. The **Add PDFs** and **Convert All** controls support sequential batch conversion while reusing one Microsoft Word application instance.
 
-For equation-heavy or font-sensitive PDFs, enable **Preserve exact PDF appearance**. This creates a DOCX with one high-resolution PDF page image per Word page, preserving the original equations, embedded fonts, diagrams, and page geometry. The page contents are visually faithful but are not individually editable. Leave it disabled when you need Word's editable text conversion.
+**Preserve exact PDF appearance** is enabled by default. Keep it enabled for equation-heavy or font-sensitive PDFs. This creates a DOCX with one high-resolution PDF page image per Word page, preserving the original equations, embedded fonts, diagrams, and page geometry. The page contents are visually faithful but are not individually editable. Uncheck it only when you need Word's editable text conversion.
 
 For example, the supplied TeX-generated homework uses embedded Latin Modern text and math fonts. Word's editable PDF importer may substitute fonts and flatten equations into ordinary text or shapes; the exact-appearance mode retains the original Latin Modern rendering.
 
@@ -54,7 +54,7 @@ Some Word for Mac releases have an AppleScript compatibility problem where Word 
 
 ## How conversion works
 
-The application opens the PDF in Microsoft Word using the platform's native automation interface, lets Word perform its native PDF reflow/import, and saves the result as a DOCX file. Conversion quality should therefore be approximately equivalent to manually opening the PDF in Word and saving it as DOCX.
+When exact appearance is disabled, the application opens the PDF in Microsoft Word using the platform's native automation interface, lets Word perform its native PDF reflow/import, and saves the result as a DOCX file. Conversion quality should therefore be approximately equivalent to manually opening the PDF in Word and saving it as DOCX.
 
 The exact-appearance mode uses PyMuPDF only to render each PDF page and `python-docx` only to place those rendered pages into a DOCX. It does not attempt to reconstruct PDF text or equations. A PDF does not generally contain the original LaTeX source, so truly editable Word equations require the original `.tex` source or a separate math-OCR workflow.
 
@@ -67,7 +67,7 @@ The interface remains responsive because Word automation runs in a background th
 - Password-protected PDFs may fail to open.
 - Some equations, fonts, and complicated diagrams may not remain fully editable.
 - If exact visual identity is more important than editability, a page-as-image DOCX workflow is required; that is a separate mode from Word's native editable conversion.
-- This application requires Windows or macOS and the desktop version of Microsoft Word.
+- The editable Word mode requires Windows or macOS and the desktop version of Microsoft Word; exact-appearance mode does not use Word's PDF importer.
 - A cancellation request safely stops after the current Word operation; it does not forcibly terminate Word while it is saving.
 
 Technical exception details are written to `pdf_to_word_converter.log` beside the application when the directory is writable.

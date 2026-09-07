@@ -66,7 +66,9 @@ class PDFConverterApp:
         self.is_supported = self.platform in {"Windows", "Darwin"}
         self.selected_pdf: str | None = None
         self.batch_items: list[BatchItem] = []
-        self.visual_mode_var = tk.BooleanVar(value=False)
+        # Exact appearance is the safe default for LaTeX, equations, fonts,
+        # and diagrams. Native Word reflow remains available as an opt-in.
+        self.visual_mode_var = tk.BooleanVar(value=True)
         self.is_converting = False
         self.cancel_event = threading.Event()
         self.close_when_done = False
@@ -109,7 +111,7 @@ class PDFConverterApp:
         )
         ttk.Label(
             header,
-            text="Convert PDF documents into editable Microsoft Word files using Word's native conversion engine on Windows or macOS.",
+            text="Preserve PDF page appearance by default; optionally use Word's editable conversion on Windows or macOS.",
             style="Subtitle.TLabel",
             wraplength=620,
         ).grid(row=1, column=0, sticky="w", pady=(4, 0))
@@ -137,7 +139,7 @@ class PDFConverterApp:
 
         self.visual_mode_checkbutton = ttk.Checkbutton(
             single,
-            text="Preserve exact PDF appearance (best for equations and fonts)",
+            text="Preserve exact PDF appearance (recommended; avoids Word automation)",
             variable=self.visual_mode_var,
         )
         self.visual_mode_checkbutton.grid(
@@ -145,7 +147,7 @@ class PDFConverterApp:
         )
         ttk.Label(
             single,
-            text="Uses page images, so the result is visually faithful but its text and equations are not individually editable.",
+            text="Enabled by default for LaTeX, equations, fonts, diagrams, and page ordering. Uncheck only when you need editable Word text.",
             style="Subtitle.TLabel",
             wraplength=620,
         ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(3, 0))
