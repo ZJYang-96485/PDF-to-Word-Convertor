@@ -65,9 +65,10 @@ Then:
 
 1. Open the original `.tex` file.
 2. Keep **Auto compile** enabled, or click **Compile / Preview** after editing.
-3. If the source is a body fragment without a preamble, the workspace supplies an `exam` wrapper automatically.
-4. If figures referenced by `\includegraphics` are missing, the workspace looks for a same-name PDF and recovers the embedded figures into its temporary build directory. The original `.tex` and PDF are not modified.
-5. Use **Export Exact Word** to preserve every rendered page exactly, or **Export Editable Word** to create a reflowable Word document with native Word equations (OMML), editable text, and embedded source figures. The editable export also restores solution frames, boxed-answer structure, question and part point totals, list numbering, header separators, and page-number fields.
+3. If the source is a body fragment without a preamble, the workspace first looks in the same folder for an Overleaf-style master `.tex` file that actively includes it. It reuses that master preamble and copies local `\input`/`\include` style files such as `juliastyle.tex`, so the VS Code preview and Word export use the same packages, fonts, and document setup as Overleaf. Commented-out includes are ignored.
+4. If no matching master file is found, the workspace supplies a small `exam` wrapper automatically. If a referenced local style file is missing, the compile log names it instead of silently substituting another setup.
+5. If figures referenced by `\includegraphics` are missing, the workspace looks for a same-name PDF and recovers the embedded figures into its temporary build directory. If a PDF contains only a transparent image object, it crops the visible figure from the matching PDF page. The original `.tex` and PDF are not modified.
+6. Use **Export Exact Word** to preserve every rendered page exactly, or **Export Editable Word** to create a reflowable Word document with native Word equations (OMML), editable text, and embedded source figures. The editable export also restores solution frames, boxed-answer structure, question and part point totals, list numbering, header separators, and page-number fields.
 
 The `.tex` file remains the source of truth, so you edit equations in LaTeX once and the workspace regenerates both the preview and Word output. You do not need to rewrite LaTeX during conversion: the source is read automatically. The editable export requires `make4ht` and LibreOffice; if either is missing, the app reports the installation requirement instead of silently producing the broken PDF reconstruction. Exact Word export is visually faithful but page content is not individually editable; editable Word export can reflow equations and layout.
 

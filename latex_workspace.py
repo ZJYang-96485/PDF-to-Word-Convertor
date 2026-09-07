@@ -35,6 +35,9 @@ LOGGER = logging.getLogger(__name__)
 INCLUDE_GRAPHICS_RE = re.compile(
     r"\\includegraphics(?:\s*\[[^]]*\])?\s*\{([^}]+)\}"
 )
+INCLUDE_GRAPHICS_DETAILS_RE = re.compile(
+    r"\\includegraphics\s*(?:\[([^]]*)\])?\s*\{([^}]+)\}"
+)
 
 
 class LatexWorkspaceError(Exception):
@@ -74,6 +77,17 @@ def _graphics_names(source: str) -> list[str]:
         if name and name not in names:
             names.append(name)
     return names
+
+
+def _graphics_widths(source: str) -> dict[str, float]:
+    """Return explicit ``includegraphics`` widths in inches when available."""
+
+    widths: dict[str, float] = {}
+    for options, raw_name in INCLUDE_GRAPHICS_DETAILS_RE.findall(source):
+        match = re.search(r"(?:^|,)\s*width\s*=\s*([0-9.]+)\s*in\b", options)
+        if match:
+            widths.setdefault(raw_name.strip(), float(match.group(1)))
+    return widths
 
 
 def _find_graphic(source_dir: Path, requested_name: str) -> Path | None:
@@ -128,27 +142,50 @@ def _recover_graphics_from_pdf(
     try:
         document = fitz.open(str(reference_pdf))
         with document:
-            image_refs: list[int] = []
+            image_entries: list[tuple[int, object, object | None]] = []
             for page in document:
                 for image in page.get_images(full=True):
                     xref = int(image[0])
-                    if xref not in image_refs:
-                        image_refs.append(xref)
+                    if any(entry[0] == xref for entry in image_entries):
+                        continue
+                    rectangles = page.get_image_rects(xref)
+                    image_entries.append((xref, page, rectangles[0] if rectangles else None))
 
-            if len(image_refs) < len(missing_names):
+            if len(image_entries) < len(missing_names):
                 raise LatexWorkspaceError(
-                    f"The reference PDF contains {len(image_refs)} embedded figure(s), but the source needs {len(missing_names)}.",
+                    f"The reference PDF contains {len(image_entries)} embedded figure(s), but the source needs {len(missing_names)}.",
                     "The source refers to figures that could not all be recovered from the matching PDF.",
                 )
 
-            for requested_name, xref in zip(missing_names, image_refs):
+            for requested_name, (xref, page, rectangle) in zip(missing_names, image_entries):
                 destination = build_dir / Path(requested_name)
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 pixmap = fitz.Pixmap(document, xref)
                 try:
-                    # The source usually specifies .jpg.  Pixmap.save() writes
-                    # the format implied by that extension.
-                    pixmap.save(str(destination))
+                    samples = pixmap.samples
+                    if samples and max(samples) != min(samples):
+                        # The source usually specifies .jpg.  Pixmap.save()
+                        # writes the format implied by that extension.
+                        pixmap.save(str(destination))
+                    elif rectangle is not None:
+                        # Some LaTeX/PDF pipelines leave a transparent image
+                        # XObject in the PDF while the visible figure is
+                        # rendered into the page.  Crop that page rectangle
+                        # instead of exporting a solid black placeholder.
+                        rendered = page.get_pixmap(
+                            matrix=fitz.Matrix(4, 4),
+                            clip=rectangle,
+                            alpha=False,
+                        )
+                        try:
+                            rendered.save(str(destination))
+                        finally:
+                            rendered = None
+                    else:
+                        raise LatexWorkspaceError(
+                            f"Figure {requested_name} has no visible PDF image data.",
+                            "The matching PDF contains a figure that could not be recovered.",
+                        )
                 finally:
                     pixmap = None
                 recovered.append(destination.name)
@@ -166,13 +203,114 @@ def _recover_graphics_from_pdf(
 def _wrapper_source(body_name: str) -> str:
     return f"""\\documentclass[10pt]{{exam}}
 \\usepackage[margin=1in]{{geometry}}
-\\usepackage{{amsmath,amssymb,graphicx}}
+\\usepackage{{amsmath,amssymb,enumitem,graphicx}}
 \\pointformat{{[\\thepoints]}}
 \\printanswers
 \\begin{{document}}
 \\input{{{body_name}}}
 \\end{{document}}
 """
+
+
+_TEX_INPUT_RE = re.compile(r"\\(?:input|include)\s*\{([^}]+)\}")
+
+
+def _active_tex_references(source: str) -> list[str]:
+    """Return local file references from non-commented TeX lines."""
+
+    active_source = "\n".join(
+        line for line in source.splitlines() if not line.lstrip().startswith("%")
+    )
+    return _TEX_INPUT_RE.findall(active_source)
+
+
+def _find_master_template(tex_path: Path, source: str) -> Path | None:
+    """Find a local master file that includes the selected source fragment.
+
+    A fragment is often compiled by VSCode through a project master such as
+    ``main.tex``.  Reusing that master is important because its packages,
+    fonts, and custom style files are part of the document's visual contract.
+    Only an exact include of the selected source is accepted, so an unrelated
+    TeX file in the same folder cannot silently change the result.
+    """
+
+    if _is_standalone_tex(source):
+        return None
+    target_names = {tex_path.name, tex_path.stem}
+    for candidate in sorted(tex_path.parent.glob("*.tex")):
+        if candidate.resolve() == tex_path.resolve():
+            continue
+        try:
+            candidate_source = candidate.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if not _is_standalone_tex(candidate_source):
+            continue
+        for reference in _active_tex_references(candidate_source):
+            reference_name = Path(reference.strip()).name
+            if reference_name in target_names or Path(reference_name).stem in target_names:
+                return candidate
+    return None
+
+
+def _resolve_tex_reference(base_dir: Path, reference: str) -> Path | None:
+    """Resolve a local ``input``/``include`` reference, with TeX extensions."""
+
+    requested = Path(reference.strip())
+    if requested.is_absolute():
+        return None
+    candidates = [base_dir / requested]
+    if requested.suffix == "":
+        candidates.extend((base_dir / f"{requested}{extension}") for extension in (".tex", ".sty"))
+    return next((candidate for candidate in candidates if candidate.is_file()), None)
+
+
+def _template_wrapper_source(
+    template_path: Path,
+    body_name: str,
+    project_dir: Path,
+) -> tuple[str, list[str]]:
+    """Build a wrapper from a project's master preamble and copy its styles."""
+
+    template = template_path.read_text(encoding="utf-8")
+    preamble, _separator, _document_body = template.partition(r"\begin{document}")
+    warnings: list[str] = [f"Using project style template: {template_path.name}"]
+    pending = _active_tex_references(preamble)
+    visited: set[Path] = set()
+    missing: list[str] = []
+    while pending:
+        reference = pending.pop(0)
+        resolved = _resolve_tex_reference(template_path.parent, reference)
+        if resolved is None:
+            missing.append(reference)
+            continue
+        resolved = resolved.resolve()
+        if resolved in visited:
+            continue
+        visited.add(resolved)
+        relative = resolved.relative_to(template_path.parent.resolve())
+        destination = project_dir / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(resolved, destination)
+        try:
+            support_source = resolved.read_text(encoding="utf-8")
+        except OSError:
+            support_source = ""
+        pending.extend(_active_tex_references(support_source))
+
+    for reference in missing:
+        escaped = re.escape(reference)
+        preamble, replacements = re.subn(
+            rf"^[ \t]*\\(?:input|include)\s*\{{{escaped}\}}[ \t]*(?:%[^\n]*)?(?:\n|$)",
+            f"% PDF-to-Word: omitted missing local style file {reference}\n",
+            preamble,
+            flags=re.MULTILINE,
+        )
+        if replacements:
+            warnings.append(f"Omitted missing local style file: {reference}")
+
+    wrapper = f"{preamble}\n\\begin{{document}}\n\\input{{{body_name}}}\n\\end{{document}}\n"
+    return wrapper, warnings
 
 
 _TEX4HT_DISPLAY_ALIGNMENT_RE = re.compile(
@@ -309,9 +447,23 @@ def _tool_path(names: tuple[str, ...], extra_paths: tuple[str, ...] = ()) -> str
 
 
 def _repair_odt_manifest(odt_path: Path) -> Path:
-    """Fix TeX4ht's legacy image MIME labels before LibreOffice imports ODT."""
+    """Repair TeX4ht ODT metadata/XML before LibreOffice imports it.
+
+    Older TeX4ht releases can emit a malformed ``content.xml`` for nested
+    ``exam`` parts/lists.  LibreOffice refuses that package even though the
+    PDF compilation succeeded.  Recovering only that XML file keeps the text
+    and editable math while allowing LibreOffice to open the document.
+    """
 
     repaired = odt_path.with_name(odt_path.stem + "-fixed.odt")
+    try:
+        from lxml import etree  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise LatexWorkspaceError(
+            "lxml is required to repair TeX4ht's ODT output.",
+            "Install the project requirements, then try editable Word export again.",
+        ) from exc
+
     with zipfile.ZipFile(odt_path, "r") as source, zipfile.ZipFile(
         repaired, "w", compression=zipfile.ZIP_DEFLATED
     ) as destination:
@@ -324,6 +476,23 @@ def _repair_odt_manifest(odt_path: Path) -> Path:
                 manifest = manifest.replace(r"\image:mimegif ", "image/gif")
                 manifest = manifest.replace(r"\image:mimebmp ", "image/bmp")
                 data = manifest.encode("utf-8")
+            elif item.filename == "content.xml":
+                try:
+                    etree.fromstring(data)
+                except etree.XMLSyntaxError:
+                    parser = etree.XMLParser(recover=True, huge_tree=True)
+                    root = etree.fromstring(data, parser)
+                    if root is None:
+                        raise LatexWorkspaceError(
+                            "TeX4ht produced an unrecoverable content.xml file.",
+                            "The editable Word export could not repair the intermediate document structure.",
+                        )
+                    data = etree.tostring(
+                        root,
+                        xml_declaration=True,
+                        encoding="UTF-8",
+                        standalone=True,
+                    )
             destination.writestr(item, data)
     return repaired
 
@@ -810,11 +979,25 @@ class LatexSourceDocxConverter:
                 "Install the project requirements, then try editable Word export again.",
             ) from exc
 
-        anchors = [paragraph for paragraph in document.paragraphs if "shown below" in paragraph.text]
+        anchors = [
+            paragraph
+            for paragraph in document.paragraphs
+            if "shown below" in paragraph.text
+            or ("shown" in paragraph.text and "Figure" in paragraph.text)
+        ]
+        if len(anchors) < len(figure_paths):
+            # Some TeX4ht versions split or simplify the figure sentence.
+            # Use a nearby figure reference as a final source-aware anchor.
+            anchors = [
+                paragraph
+                for paragraph in document.paragraphs
+                if "Figure" in paragraph.text or "figure" in paragraph.text
+            ]
         if len(anchors) < len(figure_paths):
             LOGGER.warning("Could not locate all figure anchors in the generated DOCX.")
             return
 
+        widths = _graphics_widths(self.source_text)
         for anchor, figure_path in zip(anchors, figure_paths):
             paragraph_element = OxmlElement("w:p")
             anchor._p.addnext(paragraph_element)
@@ -822,7 +1005,8 @@ class LatexSourceDocxConverter:
             paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
             paragraph.paragraph_format.space_before = Pt(3)
             paragraph.paragraph_format.space_after = Pt(6)
-            paragraph.add_run().add_picture(str(figure_path), width=Inches(3.575))
+            width = widths.get(figure_path.stem, 3.575)
+            paragraph.add_run().add_picture(str(figure_path), width=Inches(width))
     def close(self) -> None:
         return None
 
@@ -878,6 +1062,7 @@ def compile_latex(
     build_dir.mkdir()
 
     standalone = _is_standalone_tex(source_text)
+    setup_warnings: list[str] = []
     if standalone:
         main_name = tex_path.name
         main_path = project_dir / main_name
@@ -886,13 +1071,22 @@ def compile_latex(
         body_name = "source_body.tex"
         (project_dir / body_name).write_text(source_text, encoding="utf-8")
         main_name = "main.tex"
-        (project_dir / main_name).write_text(_wrapper_source(body_name), encoding="utf-8")
+        template_path = _find_master_template(tex_path, source_text)
+        if template_path is None:
+            wrapper = _wrapper_source(body_name)
+        else:
+            wrapper, setup_warnings = _template_wrapper_source(
+                template_path,
+                body_name,
+                project_dir,
+            )
+        (project_dir / main_name).write_text(wrapper, encoding="utf-8")
 
     _copy_existing_graphics(tex_path.parent, project_dir, source_text)
     recovered_assets = _recover_graphics_from_pdf(source_text, reference_pdf, project_dir)
 
     command = _compile_command(main_name, engine, build_dir)
-    log_parts: list[str] = []
+    log_parts: list[str] = setup_warnings.copy()
     try:
         first = subprocess.run(
             command,
