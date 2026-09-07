@@ -14,8 +14,11 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable
 
 from converter import (
+    MacWordConverter,
     PDFConversionError,
+    VisualFidelityConverter,
     WordPDFConverter,
+    create_word_converter,
     normalise_output_path,
     normalise_pdf_path,
 )
@@ -59,9 +62,11 @@ class PDFConverterApp:
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.is_windows = platform.system() == "Windows"
+        self.platform = platform.system()
+        self.is_supported = self.platform in {"Windows", "Darwin"}
         self.selected_pdf: str | None = None
         self.batch_items: list[BatchItem] = []
+        self.visual_mode_var = tk.BooleanVar(value=False)
         self.is_converting = False
         self.cancel_event = threading.Event()
         self.close_when_done = False
@@ -78,8 +83,8 @@ class PDFConverterApp:
         self.output_path_var.trace_add("write", self._on_output_changed)
         self._update_button_states()
 
-        if not self.is_windows:
-            self.root.after(150, self._show_windows_required)
+        if not self.is_supported:
+            self.root.after(150, self._show_platform_required)
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -104,7 +109,7 @@ class PDFConverterApp:
         )
         ttk.Label(
             header,
-            text="Convert PDF documents into editable Microsoft Word files using Word's native conversion engine.",
+            text="Convert PDF documents into editable Microsoft Word files using Word's native conversion engine on Windows or macOS.",
             style="Subtitle.TLabel",
             wraplength=620,
         ).grid(row=1, column=0, sticky="w", pady=(4, 0))
@@ -129,6 +134,21 @@ class PDFConverterApp:
             single, text="Browse Output Location", command=self._browse_output
         )
         self.output_browse_button.grid(row=2, column=2, sticky="e")
+
+        self.visual_mode_checkbutton = ttk.Checkbutton(
+            single,
+            text="Preserve exact PDF appearance (best for equations and fonts)",
+            variable=self.visual_mode_var,
+        )
+        self.visual_mode_checkbutton.grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=(10, 0)
+        )
+        ttk.Label(
+            single,
+            text="Uses page images, so the result is visually faithful but its text and equations are not individually editable.",
+            style="Subtitle.TLabel",
+            wraplength=620,
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(3, 0))
 
         batch = ttk.LabelFrame(main, text="Batch conversion", style="Section.TLabelframe")
         batch.grid(row=2, column=0, sticky="nsew", pady=(0, 12))
@@ -196,13 +216,13 @@ class PDFConverterApp:
         self.progress = ttk.Progressbar(progress_frame, mode="indeterminate")
         self.progress.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(7, 0))
 
-    def _show_windows_required(self) -> None:
+    def _show_platform_required(self) -> None:
         messagebox.showerror(
-            "Windows Required",
-            "This application requires Windows and Microsoft Word because it uses Word's native PDF conversion engine.",
+            "Windows or macOS Required",
+            "This application requires Windows or macOS with desktop Microsoft Word because it uses Word's native PDF conversion engine.",
             parent=self.root,
         )
-        self.status_var.set("Windows and Microsoft Word are required")
+        self.status_var.set("Windows/macOS and Microsoft Word are required")
 
     def _select_pdf(self) -> None:
         path = filedialog.askopenfilename(
@@ -303,7 +323,9 @@ class PDFConverterApp:
             self.status_var.set("Conversion cancelled")
             return
         self._start_conversion(
-            [BatchJob(BatchItem(self.selected_pdf), str(output_path), overwrite)], batch=False
+            [BatchJob(BatchItem(self.selected_pdf), str(output_path), overwrite)],
+            batch=False,
+            visual_mode=self.visual_mode_var.get(),
         )
 
     def _begin_batch_conversion(self) -> None:
@@ -321,7 +343,7 @@ class PDFConverterApp:
         if not jobs:
             self.status_var.set("No files to convert")
             return
-        self._start_conversion(jobs, batch=True)
+        self._start_conversion(jobs, batch=True, visual_mode=self.visual_mode_var.get())
 
     def _confirm_overwrite(self, output_path: Path) -> bool | None:
         if not output_path.exists():
@@ -334,28 +356,40 @@ class PDFConverterApp:
             return True
         return None
 
-    def _start_conversion(self, jobs: list[BatchJob], *, batch: bool) -> None:
+    def _start_conversion(
+        self, jobs: list[BatchJob], *, batch: bool, visual_mode: bool
+    ) -> None:
         self.is_converting = True
         self.close_when_done = False
         self.cancel_event.clear()
         self._set_busy(True)
-        self.status_var.set("Starting Microsoft Word...")
+        self.status_var.set(
+            "Preparing exact-appearance Word document..."
+            if visual_mode
+            else "Starting Microsoft Word..."
+        )
         worker = threading.Thread(
             target=self._conversion_worker,
-            args=(jobs, batch),
+            args=(jobs, batch, visual_mode),
             daemon=True,
             name="pdf-to-word-converter",
         )
         worker.start()
 
-    def _conversion_worker(self, jobs: list[BatchJob], batch: bool) -> None:
-        converter: WordPDFConverter | None = None
+    def _conversion_worker(
+        self, jobs: list[BatchJob], batch: bool, visual_mode: bool
+    ) -> None:
+        converter: WordPDFConverter | MacWordConverter | VisualFidelityConverter | None = None
         completed: list[tuple[BatchJob, str]] = []
         failures: list[tuple[BatchJob, Exception]] = []
         cancelled = False
 
         try:
-            converter = WordPDFConverter(visible=False)
+            converter = (
+                VisualFidelityConverter()
+                if visual_mode
+                else create_word_converter(visible=False)
+            )
             converter.start()
             for job_index, job in enumerate(jobs):
                 if self.cancel_event.is_set():
@@ -484,16 +518,26 @@ class PDFConverterApp:
 
     def _open_word_file(self, docx_path: str) -> None:
         try:
-            if not hasattr(os, "startfile"):
-                raise OSError("Opening files is supported on Windows only.")
-            os.startfile(docx_path)  # type: ignore[attr-defined]
+            if self.platform == "Windows":
+                if not hasattr(os, "startfile"):
+                    raise OSError("Windows file launching is unavailable.")
+                os.startfile(docx_path)  # type: ignore[attr-defined]
+            elif self.platform == "Darwin":
+                subprocess.Popen(["open", docx_path])
+            else:
+                raise OSError("Opening files is supported on Windows and macOS only.")
         except OSError as exc:
             LOGGER.exception("Could not open Word file: %s", docx_path)
             messagebox.showerror("Could not open file", str(exc), parent=self.root)
 
     def _open_folder(self, docx_path: str) -> None:
         try:
-            subprocess.Popen(["explorer", "/select,", os.path.normpath(docx_path)])
+            if self.platform == "Windows":
+                subprocess.Popen(["explorer", "/select,", os.path.normpath(docx_path)])
+            elif self.platform == "Darwin":
+                subprocess.Popen(["open", "-R", docx_path])
+            else:
+                raise OSError("Opening folders is supported on Windows and macOS only.")
         except OSError as exc:
             LOGGER.exception("Could not open Explorer for: %s", docx_path)
             messagebox.showerror("Could not open folder", str(exc), parent=self.root)
@@ -523,6 +567,7 @@ class PDFConverterApp:
             self.clear_button,
             self.convert_button,
             self.convert_all_button,
+            self.visual_mode_checkbutton,
         ]
         for control in controls:
             if busy:
@@ -542,7 +587,7 @@ class PDFConverterApp:
     def _update_button_states(self, *_args: Any) -> None:
         if self.is_converting:
             return
-        if not self.is_windows:
+        if not self.is_supported:
             for control in (
                 self.select_button,
                 self.output_browse_button,
