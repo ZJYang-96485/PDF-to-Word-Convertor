@@ -3,7 +3,7 @@
 The workspace keeps the user's source file as the editable authority.  It
 compiles a temporary copy so generated files and recovered PDF assets do not
 pollute the source folder, displays the resulting PDF beside the source, and
-hands the compiled PDF to the existing Word export backends.
+exports the source to either an exact-appearance or editable Word document.
 """
 
 from __future__ import annotations
@@ -20,14 +20,14 @@ import sys
 import tempfile
 import threading
 import tkinter as tk
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from typing import Callable
 from converter import (
-    PDFConversionError,
-    Pdf2DocxConverter,
     VisualFidelityConverter,
-    create_word_converter,
+    normalise_output_path,
 )
 
 
@@ -173,6 +173,614 @@ def _wrapper_source(body_name: str) -> str:
 \\input{{{body_name}}}
 \\end{{document}}
 """
+
+
+_TEX4HT_DISPLAY_ALIGNMENT_RE = re.compile(
+    r"\$\$\s*\\begin\{aligned\}(.*?)\\end\{aligned\}\s*\$\$",
+    re.DOTALL,
+)
+_TEX4HT_STANDALONE_ALIGNMENT_RE = re.compile(
+    r"\\begin\{(align\*|eqnarray\*)\}(.*?)\\end\{\1\}",
+    re.DOTALL,
+)
+_TEX4HT_INLINE_DOLLAR_RE = re.compile(r"(?<!\$)\$(?!\$)([^$\n]+?)\$(?!\$)")
+_BOX_MARKER_RE = re.compile(r"PDFBox[SE]\d{3}")
+
+
+def _mark_boxed_math(source: str) -> str:
+    """Add private markers so boxed formulas can be restored as Word boxes.
+
+    TeX4ht and LibreOffice preserve the formula itself as editable OMML, but
+    they otherwise drop ``\\boxed{...}``.  A temporary text marker travels
+    through the math conversion and is removed after the DOCX is created.
+    """
+
+    output: list[str] = []
+    cursor = 0
+    marker_number = 1
+    while True:
+        start_token = source.find(r"\boxed{", cursor)
+        if start_token < 0:
+            output.append(source[cursor:])
+            break
+        output.append(source[cursor:start_token])
+        content_start = start_token + len(r"\boxed{")
+        depth = 1
+        index = content_start
+        while index < len(source) and depth:
+            character = source[index]
+            escaped = index > 0 and source[index - 1] == "\\"
+            if character == "{" and not escaped:
+                depth += 1
+            elif character == "}" and not escaped:
+                depth -= 1
+            index += 1
+        if depth:
+            output.append(source[start_token:])
+            break
+        content = source[content_start : index - 1]
+        start_marker = f"PDFBoxS{marker_number:03d}"
+        end_marker = f"PDFBoxE{marker_number:03d}"
+        output.append(
+            r"\boxed{"
+            + rf"\text{{{start_marker}}}\,"
+            + content
+            + rf"\,\text{{{end_marker}}}"
+            + "}"
+        )
+        marker_number += 1
+        cursor = index
+    return "".join(output)
+
+
+def _tex4ht_source(source: str) -> str:
+    """Make alignment-heavy math safe for TeX4ht's ODT backend.
+
+    TeX4ht correctly converts ordinary LaTeX math to MathML, which LibreOffice
+    then converts to native Word OMML.  Its ODT backend does not handle the
+    alignment tabs in ``aligned``/``align``/``eqnarray`` reliably, though: the
+    tabs can become stray glyphs or push a formula outside the page width.
+    Keep every equation and line break, but export each aligned row as a
+    separate display equation.  This avoids TeX4ht's malformed ODT tables and
+    keeps long rows inside the Word page width.  The user's source and the PDF
+    preview remain unchanged.
+    """
+
+    def rows(body: str) -> list[str]:
+        return [
+            row.replace("&", "").strip()
+            for row in re.split(r"\\\\(?:\s*\[[^]]*\])?", body)
+            if row.strip()
+        ]
+
+    def replace_display_alignment(match: re.Match[str]) -> str:
+        return "\n".join(
+            f"\\begin{{equation*}}\n{row}\n\\end{{equation*}}" for row in rows(match.group(1))
+        )
+
+    def replace_standalone_alignment(match: re.Match[str]) -> str:
+        return "\n".join(
+            f"\\begin{{equation*}}\n{row}\n\\end{{equation*}}" for row in rows(match.group(2))
+        )
+
+    source = _mark_boxed_math(source)
+    source = _TEX4HT_DISPLAY_ALIGNMENT_RE.sub(replace_display_alignment, source)
+    source = _TEX4HT_STANDALONE_ALIGNMENT_RE.sub(replace_standalone_alignment, source)
+    if r"\begin{enumerate}" in source and r"\labelenumi" not in source:
+        source = source.replace(
+            r"\begin{enumerate}",
+            r"\renewcommand{\labelenumi}{\arabic{enumi}.}\begin{enumerate}",
+        )
+
+    def preserve_inline_word_space(match: re.Match[str]) -> str:
+        following = source[match.end() :]
+        next_significant = re.match(r"\s*(\S)", following)
+        if next_significant and (next_significant.group(1).isalnum() or next_significant.group(1) == "\\"):
+            return match.group(0) + r"\ "
+        return match.group(0)
+
+    return _TEX4HT_INLINE_DOLLAR_RE.sub(preserve_inline_word_space, source)
+
+
+def _tool_path(names: tuple[str, ...], extra_paths: tuple[str, ...] = ()) -> str | None:
+    for name in names:
+        found = _command_path(name)
+        if found:
+            return found
+    for candidate in extra_paths:
+        if Path(candidate).is_file():
+            return candidate
+    return None
+
+
+def _repair_odt_manifest(odt_path: Path) -> Path:
+    """Fix TeX4ht's legacy image MIME labels before LibreOffice imports ODT."""
+
+    repaired = odt_path.with_name(odt_path.stem + "-fixed.odt")
+    with zipfile.ZipFile(odt_path, "r") as source, zipfile.ZipFile(
+        repaired, "w", compression=zipfile.ZIP_DEFLATED
+    ) as destination:
+        for item in source.infolist():
+            data = source.read(item.filename)
+            if item.filename == "META-INF/manifest.xml":
+                manifest = data.decode("utf-8")
+                manifest = manifest.replace(r"\image:mimejpg ", "image/jpeg")
+                manifest = manifest.replace(r"\image:mimepng ", "image/png")
+                manifest = manifest.replace(r"\image:mimegif ", "image/gif")
+                manifest = manifest.replace(r"\image:mimebmp ", "image/bmp")
+                data = manifest.encode("utf-8")
+            destination.writestr(item, data)
+    return repaired
+
+
+class LatexSourceDocxConverter:
+    """Convert compiled LaTeX source to editable Word math and text.
+
+    The source is first passed through TeX4ht's ODT backend.  LibreOffice then
+    converts the ODT into DOCX, preserving the equations as Word OMML rather
+    than flattening them into page screenshots.
+    """
+
+    def __init__(self, compile_result: CompileResult, tex_path: Path, source_text: str) -> None:
+        self.compile_result = compile_result
+        self.tex_path = tex_path
+        self.source_text = source_text
+
+    def convert_pdf(
+        self,
+        pdf_path: Path,
+        output_path: Path,
+        *,
+        overwrite: bool = False,
+        status_callback: Callable[[str], None] | None = None,
+    ) -> str:
+        output = normalise_output_path(pdf_path, output_path)
+        if output.exists() and not overwrite:
+            raise LatexWorkspaceError(
+                f"The output already exists: {output}",
+                "Choose a different Word filename or approve replacing the existing file.",
+            )
+        if not output.parent.is_dir() or not os.access(output.parent, os.W_OK):
+            raise LatexWorkspaceError(
+                f"The output folder is not writable: {output.parent}",
+                "The Word file could not be saved. Check the selected output folder.",
+            )
+
+        make4ht = _tool_path(
+            ("make4ht",),
+            ("/Library/TeX/texbin/make4ht", "/usr/local/bin/make4ht"),
+        )
+        soffice = _tool_path(
+            ("soffice", "libreoffice"),
+            (
+                "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+                r"C:\\Program Files\\LibreOffice\\program\\soffice.exe",
+                r"C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
+            ),
+        )
+        if make4ht is None:
+            raise LatexWorkspaceError(
+                "TeX4ht make4ht was not found.",
+                "Editable LaTeX-to-Word export requires TeX Live or MiKTeX with TeX4ht (make4ht).",
+            )
+        if soffice is None:
+            raise LatexWorkspaceError(
+                "LibreOffice soffice was not found.",
+                "Editable LaTeX-to-Word export requires LibreOffice. Install it, restart the app, and try again.",
+            )
+
+        project_dir = self.compile_result.build_dir.parent / "project"
+        main_name = self.compile_result.pdf_path.with_suffix(".tex").name
+        compiled_main = project_dir / main_name
+        if not compiled_main.is_file():
+            raise LatexWorkspaceError(
+                f"The compiled LaTeX project is incomplete: {compiled_main}",
+                "Compile the LaTeX source again before exporting editable Word.",
+            )
+
+        export_root = Path(tempfile.mkdtemp(prefix="pdf_to_word_tex4ht_"))
+        tex4ht_project = export_root / "project"
+        odt_dir = export_root / "odt"
+        docx_dir = export_root / "docx"
+        odt_dir.mkdir()
+        docx_dir.mkdir()
+        shutil.copytree(project_dir, tex4ht_project)
+
+        if _is_standalone_tex(self.source_text):
+            (tex4ht_project / main_name).write_text(
+                _tex4ht_source(self.source_text), encoding="utf-8"
+            )
+        else:
+            body_path = tex4ht_project / "source_body.tex"
+            body_path.write_text(_tex4ht_source(self.source_text), encoding="utf-8")
+
+        self._notify(status_callback, "Converting LaTeX source to editable document structure...")
+        make_result = subprocess.run(
+            [make4ht, "-a", "warning", "-f", "odt", "-d", str(odt_dir), str(tex4ht_project / main_name)],
+            cwd=str(tex4ht_project),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        odt_path = odt_dir / Path(main_name).with_suffix(".odt").name
+        make_log = "\n".join(part for part in (make_result.stdout, make_result.stderr) if part)
+        if not odt_path.is_file():
+            raise LatexWorkspaceError(
+                f"TeX4ht could not create an ODT file:\n{make_log}",
+                "TeX4ht could not convert this LaTeX source. Review the compiler installation and source log.",
+            )
+
+        odt_for_import = _repair_odt_manifest(odt_path)
+        self._notify(status_callback, "Converting editable equations to Word format...")
+        office_result = subprocess.run(
+            [soffice, "--headless", "--convert-to", "docx", "--outdir", str(docx_dir), str(odt_for_import)],
+            cwd=str(docx_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        generated_docx = docx_dir / odt_for_import.with_suffix(".docx").name
+        office_log = "\n".join(part for part in (office_result.stdout, office_result.stderr) if part)
+        if office_result.returncode != 0 or not generated_docx.is_file():
+            raise LatexWorkspaceError(
+                f"LibreOffice could not create DOCX:\n{office_log}",
+                "LibreOffice could not finish the editable Word export. Make sure LibreOffice is installed and try again.",
+            )
+
+        try:
+            shutil.copy2(generated_docx, output)
+        except OSError as exc:
+            raise LatexWorkspaceError(
+                f"Could not save the DOCX to {output}: {exc}",
+                "The editable Word file could not be saved to the selected location.",
+            ) from exc
+        self._postprocess_docx(output, project_dir)
+        return str(output)
+
+    @staticmethod
+    def _notify(callback: Callable[[str], None] | None, message: str) -> None:
+        if callback is not None:
+            try:
+                callback(message)
+            except Exception:
+                LOGGER.exception("Status callback failed.")
+
+    def _postprocess_docx(self, docx_path: Path, project_dir: Path) -> None:
+        """Restore source-level structure that ODT cannot represent directly."""
+
+        try:
+            from docx import Document  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise LatexWorkspaceError(
+                "python-docx is required to finish the editable DOCX structure.",
+                "Install the project requirements, then try editable Word export again.",
+            ) from exc
+
+        document = Document(str(docx_path))
+        self._clean_header(document)
+        self._restore_question_points(document)
+        self._clean_leaked_part_points(document)
+        self._restore_boxed_equations(document)
+        self._restore_list_labels(document)
+        self._restore_solution_frames(document)
+        self._add_page_numbers(document)
+        self._insert_figures(document, project_dir)
+        document.save(str(docx_path))
+
+    @staticmethod
+    def _set_paragraph_border(paragraph: object, sides: tuple[str, ...]) -> None:
+        from docx.oxml import OxmlElement  # type: ignore[import-not-found]
+        from docx.oxml.ns import qn  # type: ignore[import-not-found]
+
+        paragraph_element = paragraph._p  # type: ignore[attr-defined]
+        properties = paragraph_element.get_or_add_pPr()
+        border = properties.find(qn("w:pBdr"))
+        if border is None:
+            border = OxmlElement("w:pBdr")
+            properties.append(border)
+        for side in sides:
+            element = border.find(qn(f"w:{side}"))
+            if element is None:
+                element = OxmlElement(f"w:{side}")
+                border.append(element)
+            element.set(qn("w:val"), "single")
+            element.set(qn("w:sz"), "6")
+            element.set(qn("w:space"), "6")
+            element.set(qn("w:color"), "000000")
+
+    @staticmethod
+    def _delete_paragraph(paragraph: object) -> None:
+        element = paragraph._element  # type: ignore[attr-defined]
+        parent = element.getparent()
+        if parent is not None:
+            parent.remove(element)
+
+    def _clean_header(self, document: object) -> None:
+        """Turn TeX4ht's underscore rules into real Word borders."""
+
+        paragraphs = list(document.paragraphs)  # type: ignore[attr-defined]
+        first_question = next(
+            (index for index, paragraph in enumerate(paragraphs) if re.fullmatch(r"\d+\.", paragraph.text.strip())),
+            len(paragraphs),
+        )
+        for index, paragraph in enumerate(paragraphs[:first_question]):
+            if "_" in paragraph.text:
+                for run in paragraph.runs:
+                    run.text = run.text.replace("_", "")
+                self._set_paragraph_border(paragraph, ("bottom",))
+            elif not paragraph.text.strip():
+                self._delete_paragraph(paragraph)
+
+        tables = list(document.tables)  # type: ignore[attr-defined]
+        if tables:
+            table = tables[0]
+            for row in list(table.rows):
+                if not any(cell.text.strip() for cell in row.cells):
+                    row._tr.getparent().remove(row._tr)
+            from docx.oxml import OxmlElement  # type: ignore[import-not-found]
+            from docx.oxml.ns import qn  # type: ignore[import-not-found]
+
+            for row in table.rows:
+                for cell_index, cell in enumerate(row.cells[:-1]):
+                    properties = cell._tc.get_or_add_tcPr()
+                    borders = properties.find(qn("w:tcBorders"))
+                    if borders is None:
+                        borders = OxmlElement("w:tcBorders")
+                        properties.append(borders)
+                    right = borders.find(qn("w:right"))
+                    if right is None:
+                        right = OxmlElement("w:right")
+                        borders.append(right)
+                    right.set(qn("w:val"), "single")
+                    right.set(qn("w:sz"), "4")
+                    right.set(qn("w:space"), "0")
+                    right.set(qn("w:color"), "000000")
+
+    def _restore_question_points(self, document: object) -> None:
+        """Restore exam point totals that TeX4ht drops from question labels."""
+
+        points = re.findall(r"\\question\s*\[(\d+)\]", self.source_text)
+        question_paragraphs = [
+            paragraph
+            for paragraph in document.paragraphs  # type: ignore[attr-defined]
+            if re.fullmatch(r"\d+\.", paragraph.text.strip())
+        ]
+        for paragraph, value in zip(question_paragraphs, points):
+            paragraph.text = f"{paragraph.text.strip()} [{value} points]"
+
+    @staticmethod
+    def _clean_leaked_part_points(document: object) -> None:
+        """Remove question totals that TeX4ht incorrectly copies onto ``(a)``."""
+
+        leaked = re.compile(r"^\[\d+ points\]\(([a-z])\)$")
+        for paragraph in document.paragraphs:  # type: ignore[attr-defined]
+            match = leaked.fullmatch(paragraph.text.strip())
+            if match:
+                paragraph.text = f"({match.group(1)})"
+
+    def _restore_boxed_equations(self, document: object) -> None:
+        """Convert temporary markers into native OMML border boxes."""
+
+        from docx.oxml import OxmlElement  # type: ignore[import-not-found]
+
+        math_namespace = "{http://schemas.openxmlformats.org/officeDocument/2006/math}"
+        text_tag = math_namespace + "t"
+        math_tag = math_namespace + "oMath"
+        for paragraph in document.paragraphs:  # type: ignore[attr-defined]
+            for formula in list(paragraph._p.iter(math_tag)):
+                marker_nodes = [
+                    node for node in formula.iter(text_tag) if node.text and _BOX_MARKER_RE.search(node.text)
+                ]
+                if len(marker_nodes) < 2:
+                    continue
+
+                def direct_child(node: object) -> object | None:
+                    current = node
+                    while current is not None and current.getparent() is not formula:
+                        current = current.getparent()
+                    return current
+
+                start_node = next((node for node in marker_nodes if "PDFBoxS" in (node.text or "")), None)
+                end_node = next((node for node in marker_nodes if "PDFBoxE" in (node.text or "")), None)
+                start_child = direct_child(start_node) if start_node is not None else None
+                end_child = direct_child(end_node) if end_node is not None else None
+                if start_child is None or end_child is None or start_child is end_child:
+                    continue
+                children = list(formula)
+                try:
+                    start_index = children.index(start_child)
+                    end_index = children.index(end_child)
+                except ValueError:
+                    continue
+                if start_index >= end_index:
+                    continue
+
+                for node in marker_nodes:
+                    node.text = _BOX_MARKER_RE.sub("", node.text or "")
+                border_box = OxmlElement("m:borderBox")
+                expression = OxmlElement("m:e")
+                for child in children[start_index + 1 : end_index]:
+                    formula.remove(child)
+                    expression.append(child)
+                border_box.append(expression)
+                for child in (start_child, end_child):
+                    if child.getparent() is formula:
+                        formula.remove(child)
+                formula.insert(start_index, border_box)
+
+    @staticmethod
+    def _restore_list_labels(document: object) -> None:
+        """Replace TeX4ht's presentation-only list labels with Word text."""
+
+        from docx.oxml.ns import qn  # type: ignore[import-not-found]
+        from docx.shared import Inches  # type: ignore[import-not-found]
+
+        number = 0
+        in_list = False
+        for paragraph in document.paragraphs:  # type: ignore[attr-defined]
+            style_name = paragraph.style.name if paragraph.style else ""
+            if style_name != "Inside-enumerate":
+                in_list = False
+                continue
+            number = number + 1 if in_list else 1
+            in_list = True
+            # Remove the numbering style and preserve the visual indent as
+            # direct formatting so the number can be edited like normal text.
+            paragraph.style = document.styles["dd"]  # type: ignore[attr-defined]
+            properties = paragraph._p.pPr
+            if properties is not None:
+                numbering = properties.find(qn("w:numPr"))
+                if numbering is not None:
+                    properties.remove(numbering)
+            paragraph.paragraph_format.left_indent = Inches(0.45)
+            paragraph.paragraph_format.first_line_indent = Inches(-0.2)
+            prefix_run = paragraph.add_run(f"{number}. ")
+            prefix_element = prefix_run._r
+            prefix_element.getparent().remove(prefix_element)
+            insert_at = 1 if paragraph._p.pPr is not None else 0
+            paragraph._p.insert(insert_at, prefix_element)
+
+    @staticmethod
+    def _frame_table(table: object) -> None:
+        from docx.oxml import OxmlElement  # type: ignore[import-not-found]
+        from docx.oxml.ns import qn  # type: ignore[import-not-found]
+
+        table.autofit = True  # type: ignore[attr-defined]
+        properties = table._tbl.tblPr  # type: ignore[attr-defined]
+        borders = properties.find(qn("w:tblBorders"))
+        if borders is None:
+            borders = OxmlElement("w:tblBorders")
+            properties.append(borders)
+        for side in ("top", "left", "bottom", "right"):
+            element = borders.find(qn(f"w:{side}"))
+            if element is None:
+                element = OxmlElement(f"w:{side}")
+                borders.append(element)
+            element.set(qn("w:val"), "single")
+            element.set(qn("w:sz"), "6")
+            element.set(qn("w:space"), "0")
+            element.set(qn("w:color"), "000000")
+        for cell in table.rows[0].cells:  # type: ignore[attr-defined]
+            cell_properties = cell._tc.get_or_add_tcPr()
+            margins = cell_properties.find(qn("w:tcMar"))
+            if margins is None:
+                margins = OxmlElement("w:tcMar")
+                cell_properties.append(margins)
+            for side, value in (("top", 80), ("bottom", 80), ("left", 120), ("right", 120)):
+                margin = margins.find(qn(f"w:{side}"))
+                if margin is None:
+                    margin = OxmlElement(f"w:{side}")
+                    margins.append(margin)
+                margin.set(qn("w:w"), str(value))
+                margin.set(qn("w:type"), "dxa")
+
+    def _restore_solution_frames(self, document: object) -> None:
+        """Frame each exam ``solution`` environment in an editable table cell."""
+
+        paragraphs = list(document.paragraphs)  # type: ignore[attr-defined]
+        starts = [
+            index
+            for index, paragraph in enumerate(paragraphs)
+            if paragraph.text.strip().startswith("Solution:")
+        ]
+        # Work backwards so moving one solution into a table does not disturb
+        # the paragraph elements needed to locate earlier solutions.
+        for start in reversed(starts):
+            end = len(paragraphs)
+            for index in range(start + 1, len(paragraphs)):
+                if re.fullmatch(r"\d+\.\s*(?:\[\d+ points\])?", paragraphs[index].text.strip()):
+                    end = index
+                    break
+            if end <= start:
+                continue
+            table = document.add_table(rows=1, cols=1)  # type: ignore[attr-defined]
+            self._frame_table(table)
+            table_element = table._tbl
+            body = document._body._body  # type: ignore[attr-defined]
+            body.remove(table_element)
+            body.insert(body.index(paragraphs[start]._p), table_element)
+            cell = table.cell(0, 0)
+            for index in range(start, end):
+                cell._tc.append(paragraphs[index]._p)
+
+    @staticmethod
+    def _add_page_numbers(document: object) -> None:
+        """Add editable ``Page N`` fields to every Word section footer."""
+
+        from docx.oxml import OxmlElement  # type: ignore[import-not-found]
+        from docx.oxml.ns import qn  # type: ignore[import-not-found]
+        from docx.enum.text import WD_ALIGN_PARAGRAPH  # type: ignore[import-not-found]
+
+        seen_footers: set[int] = set()
+        for section in document.sections:  # type: ignore[attr-defined]
+            footer = section.footer
+            identity = id(footer._element)
+            if identity in seen_footers:
+                continue
+            seen_footers.add(identity)
+            paragraph = footer.paragraphs[0]
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for run in list(paragraph.runs):
+                run._element.getparent().remove(run._element)
+            paragraph.add_run("Page ")
+            run = paragraph.add_run()
+            begin = OxmlElement("w:fldChar")
+            begin.set(qn("w:fldCharType"), "begin")
+            instruction = OxmlElement("w:instrText")
+            instruction.set(qn("xml:space"), "preserve")
+            instruction.text = " PAGE "
+            separate = OxmlElement("w:fldChar")
+            separate.set(qn("w:fldCharType"), "separate")
+            displayed = OxmlElement("w:t")
+            displayed.text = "1"
+            end = OxmlElement("w:fldChar")
+            end.set(qn("w:fldCharType"), "end")
+            run._r.extend((begin, instruction, separate, displayed, end))
+
+        settings = document.settings.element  # type: ignore[attr-defined]
+        update_fields = settings.find(qn("w:updateFields"))
+        if update_fields is None:
+            update_fields = OxmlElement("w:updateFields")
+            settings.append(update_fields)
+        update_fields.set(qn("w:val"), "true")
+
+    def _insert_figures(self, document: object, project_dir: Path) -> None:
+        """Restore source figures that LibreOffice omits from TeX4ht ODT."""
+
+        figure_names = _graphics_names(self.source_text)
+        if not figure_names:
+            return
+        figure_paths = [_find_graphic(project_dir, name) for name in figure_names]
+        if not all(figure_paths):
+            LOGGER.warning("Some LaTeX figures were not found for DOCX insertion: %s", figure_names)
+            return
+
+        try:
+            from docx.enum.text import WD_ALIGN_PARAGRAPH  # type: ignore[import-not-found]
+            from docx.oxml import OxmlElement  # type: ignore[import-not-found]
+            from docx.shared import Inches, Pt  # type: ignore[import-not-found]
+            from docx.text.paragraph import Paragraph  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise LatexWorkspaceError(
+                "python-docx is required to place source figures in the editable DOCX.",
+                "Install the project requirements, then try editable Word export again.",
+            ) from exc
+
+        anchors = [paragraph for paragraph in document.paragraphs if "shown below" in paragraph.text]
+        if len(anchors) < len(figure_paths):
+            LOGGER.warning("Could not locate all figure anchors in the generated DOCX.")
+            return
+
+        for anchor, figure_path in zip(anchors, figure_paths):
+            paragraph_element = OxmlElement("w:p")
+            anchor._p.addnext(paragraph_element)
+            paragraph = Paragraph(paragraph_element, anchor._parent)
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            paragraph.paragraph_format.space_before = Pt(3)
+            paragraph.paragraph_format.space_after = Pt(6)
+            paragraph.add_run().add_picture(str(figure_path), width=Inches(3.575))
+    def close(self) -> None:
+        return None
 
 
 def _compile_command(main_name: str, engine: str, build_dir: Path) -> list[str]:
@@ -588,22 +1196,32 @@ class LatexWorkspaceApp:
         self.status_var.set("Exporting Word document...")
         self.job_thread = threading.Thread(
             target=self._export_worker,
-            args=(self.preview_pdf, output_path, exact),
+            args=(self.preview_pdf, output_path, exact, self.tex_path, current_text, self.compile_result),
             daemon=True,
         )
         self.job_thread.start()
 
-    def _export_worker(self, pdf_path: Path, output_path: Path, exact: bool) -> None:
+    def _export_worker(
+        self,
+        pdf_path: Path,
+        output_path: Path,
+        exact: bool,
+        tex_path: Path | None,
+        source_text: str,
+        compile_result: CompileResult,
+    ) -> None:
         try:
             if exact:
                 converter = VisualFidelityConverter()
                 mode = "exact appearance"
-            elif platform.system() == "Darwin" and not _command_path("osascript"):
-                converter = Pdf2DocxConverter()
-                mode = "editable pdf2docx fallback"
             else:
-                converter = create_word_converter()
-                mode = "editable Word conversion"
+                if tex_path is None:
+                    raise LatexWorkspaceError(
+                        "No LaTeX source is attached to this preview.",
+                        "Open and compile a .tex source before exporting editable Word.",
+                    )
+                converter = LatexSourceDocxConverter(compile_result, tex_path, source_text)
+                mode = "editable LaTeX-source Word"
             try:
                 result = converter.convert_pdf(
                     pdf_path,
@@ -628,7 +1246,7 @@ class LatexWorkspaceApp:
 
     def _export_failed(self, exc: Exception) -> None:
         self.status_var.set("Word export failed")
-        message = exc.user_message if isinstance(exc, PDFConversionError) else str(exc)
+        message = getattr(exc, "user_message", str(exc))
         self._append_log(f"Export failed: {exc}\n")
         messagebox.showerror("Word export failed", message, parent=self.root)
 
