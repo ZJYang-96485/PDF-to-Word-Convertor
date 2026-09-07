@@ -1,12 +1,11 @@
 # PDF to Word Converter
 
-Convert PDFs to Word documents while preserving LaTeX, equations, fonts, diagrams, spacing, and page order. **Preserve exact PDF appearance** is enabled by default.
-
 ## Requirements
 
 - Python 3.10 or newer
 - Tkinter
 - Microsoft Word for the native editable mode on Windows; macOS can use the editable fallback
+- A LaTeX installation with `pdflatex`, `xelatex`, or `lualatex` for the LaTeX Workspace
 
 ## macOS setup
 
@@ -50,6 +49,26 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 The exact-appearance mode creates a Word page image for each PDF page. The result is visually faithful, but the text and equations are not individually editable.
 
 Uncheck **Preserve exact PDF appearance** only when you need editable Word text. Windows uses Microsoft Word's native PDF importer. On macOS, the app tries Word first and automatically falls back to `pdf2docx` if Word rejects the automated Save As command.
+
+## LaTeX Workspace
+
+The workspace is the editable source-first workflow. It lets you edit the `.tex` source beside a live PDF preview, compile without changing the source file, and export the compiled PDF to Word.
+
+Start it from the converter with **Open LaTeX Workspace**, or run:
+
+```bash
+python latex_workspace.py
+```
+
+Then:
+
+1. Open the original `.tex` file.
+2. Keep **Auto compile** enabled, or click **Compile / Preview** after editing.
+3. If the source is a body fragment without a preamble, the workspace supplies an `exam` wrapper automatically.
+4. If figures referenced by `\includegraphics` are missing, the workspace looks for a same-name PDF and recovers the embedded figures into its temporary build directory. The original `.tex` and PDF are not modified.
+5. Use **Export Exact Word** to preserve every rendered page exactly, or **Export Editable Word** to create a reflowable Word document.
+
+The `.tex` file remains the source of truth, so equations stay as real LaTeX and can be edited without rewriting them. Exact Word export is visually faithful but page content is not individually editable; editable Word export can reflow equations and layout.
 
 ## macOS Word permission
 

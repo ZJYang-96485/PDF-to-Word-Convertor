@@ -6,6 +6,7 @@ import logging
 import os
 import platform
 import subprocess
+import sys
 import threading
 import tkinter as tk
 from dataclasses import dataclass
@@ -115,6 +116,11 @@ class PDFConverterApp:
             style="Subtitle.TLabel",
             wraplength=620,
         ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Button(
+            header,
+            text="Open LaTeX Workspace",
+            command=self._open_latex_workspace,
+        ).grid(row=0, column=1, rowspan=2, sticky="e", padx=(12, 0))
 
         single = ttk.LabelFrame(main, text="Single PDF", style="Section.TLabelframe")
         single.grid(row=1, column=0, sticky="ew", pady=(0, 12))
@@ -225,6 +231,19 @@ class PDFConverterApp:
             parent=self.root,
         )
         self.status_var.set("Windows/macOS and Microsoft Word are required")
+
+    def _open_latex_workspace(self) -> None:
+        """Launch the source-aware editor and live PDF preview."""
+
+        workspace_script = Path(__file__).resolve().with_name("latex_workspace.py")
+        try:
+            subprocess.Popen([sys.executable, str(workspace_script)])
+        except OSError as exc:
+            messagebox.showerror(
+                "Could not open LaTeX Workspace",
+                f"The LaTeX workspace could not be started: {exc}",
+                parent=self.root,
+            )
 
     def _select_pdf(self) -> None:
         path = filedialog.askopenfilename(

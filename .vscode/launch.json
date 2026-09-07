@@ -1,0 +1,19 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Start PDF to Word Converter",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/app.py",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Start LaTeX Workspace",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/latex_workspace.py",
+      "console": "integratedTerminal"
+    }
+  ]
+}
