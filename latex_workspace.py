@@ -354,9 +354,11 @@ _TEX4HT_INLINE_DOLLAR_RE = re.compile(r"(?<!\$)\$(?!\$)([^$\n]+?)\$(?!\$)")
 _TEX_SIZE_DELIMITER_RE = re.compile(
     r"\\(?:big|Big|bigg|Bigg|bigl|Bigl|biggl|Biggl|bigr|Bigr|biggr|Biggr)\s*(\\[{}]|[()[\]])"
 )
+_TEX_ROMAN_OPERATOR_RE = re.compile(r"\\(exp|ln)(?![A-Za-z])")
 _TEX_ENV_TOKEN_RE = re.compile(r"\\(begin|end)\s*\{(parts|solution)\}")
 _BOX_MARKER_RE = re.compile(r"PDFBox[SE]\d{3}")
 _EQUALITY_MARKER_RE = re.compile(r"PDFEq\d{3}")
+_ROMAN_MARKER_RE = re.compile(r"PDFRoman[SE]\d{3}")
 
 
 def _mark_boxed_math(source: str) -> str:
@@ -475,6 +477,70 @@ def _normalise_size_delimiters(source: str) -> str:
     return _TEX_SIZE_DELIMITER_RE.sub(replace, source)
 
 
+def _mark_roman_math(source: str) -> str:
+    r"""Mark source-level roman math spans so Word can restore their style.
+
+    The ODT route preserves the equation structure but loses the distinction
+    between ordinary math italic and ``\mathrm``.  Text markers survive that
+    conversion, allowing the DOCX postprocessor to apply native OMML roman
+    styling only to the requested spans.  The parser is deliberately small:
+    it only needs to find balanced ``\mathrm{...}`` groups and the common
+    operator commands ``\exp`` and ``\ln``.
+    """
+
+    output: list[str] = []
+    cursor = 0
+    marker_number = 1
+
+    def marker_pair() -> tuple[str, str]:
+        nonlocal marker_number
+        start = f"PDFRomanS{marker_number:03d}"
+        end = f"PDFRomanE{marker_number:03d}"
+        marker_number += 1
+        return start, end
+
+    while cursor < len(source):
+        if source.startswith(r"\mathrm", cursor):
+            brace = cursor + len(r"\mathrm")
+            while brace < len(source) and source[brace].isspace():
+                brace += 1
+            if brace < len(source) and source[brace] == "{":
+                depth = 1
+                index = brace + 1
+                while index < len(source) and depth:
+                    character = source[index]
+                    escaped = index > 0 and source[index - 1] == "\\"
+                    if character == "{" and not escaped:
+                        depth += 1
+                    elif character == "}" and not escaped:
+                        depth -= 1
+                    index += 1
+                if depth == 0:
+                    start_marker, end_marker = marker_pair()
+                    content = source[brace + 1 : index - 1]
+                    output.append(source[cursor : brace + 1])
+                    output.append(rf"\text{{{start_marker}}}")
+                    output.append(content)
+                    output.append(rf"\text{{{end_marker}}}")
+                    output.append("}")
+                    cursor = index
+                    continue
+
+        operator = _TEX_ROMAN_OPERATOR_RE.match(source, cursor)
+        if operator is not None:
+            start_marker, end_marker = marker_pair()
+            output.append(
+                rf"\mathrm{{\text{{{start_marker}}}{operator.group(1)}\text{{{end_marker}}}}}"
+            )
+            cursor = operator.end()
+            continue
+
+        output.append(source[cursor])
+        cursor += 1
+
+    return "".join(output)
+
+
 def _tex4ht_source(source: str) -> str:
     """Make alignment-heavy math safe for TeX4ht's ODT backend.
 
@@ -527,6 +593,7 @@ def _tex4ht_source(source: str) -> str:
     # the same visible wording and produce a valid editable Word formula.
     source = source.replace(r"\mathrm{out\,of\,engine}", r"{out\ of\ engine}")
     source = source.replace(r"\mathrm{in\,to\,engine}", r"{in\ to\ engine}")
+    source = _mark_roman_math(source)
     source = _TEX4HT_DISPLAY_ALIGNMENT_RE.sub(replace_display_alignment, source)
     source = _TEX4HT_STANDALONE_ALIGNMENT_RE.sub(replace_standalone_alignment, source)
     if r"\begin{enumerate}" in source and r"\labelenumi" not in source:
@@ -840,11 +907,19 @@ class LatexSourceDocxConverter:
             ) from exc
 
         document = Document(str(docx_path))
+        # TeX4ht's ``dt`` style is bold by default.  It is useful for the
+        # source list indentation, but it also becomes the inherited style for
+        # OMML equation runs, which do not receive the direct ``w:b=0`` that
+        # ordinary text runs receive below.  Make the style itself regular so
+        # unbolded equations stay regular; explicit LaTeX \textbf remains a
+        # direct run-level override.
+        document.styles["dt"].font.bold = False  # type: ignore[attr-defined]
         self._clean_header(document)
         self._restore_question_points(document)
         self._clean_leaked_part_points(document)
         self._restore_part_points(document)
         self._restore_leading_equals(document)
+        self._restore_math_roman_styles(document)
         self._restore_boxed_equations(document)
         self._restore_list_labels(document)
         self._restore_solution_frames(document)
@@ -883,7 +958,12 @@ class LatexSourceDocxConverter:
     @staticmethod
     def _paragraph_has_embedded_object(paragraph: object) -> bool:
         element = paragraph._p  # type: ignore[attr-defined]
-        return bool(element.xpath(".//w:drawing")) or bool(element.xpath(".//w:pict"))
+        return (
+            bool(element.xpath(".//w:drawing"))
+            or bool(element.xpath(".//w:pict"))
+            or bool(element.xpath(".//m:oMath"))
+            or bool(element.xpath(".//m:oMathPara"))
+        )
 
     def _clean_header(self, document: object) -> None:
         """Turn TeX4ht's underscore rules into real Word borders."""
@@ -1147,6 +1227,77 @@ class LatexSourceDocxConverter:
                 # LibreOffice preserves the temporary marker as an empty
                 # math run after its text is removed.  Delete that run too;
                 # otherwise Word shows an editable dotted placeholder.
+                for run in list(formula.iter(run_tag)):
+                    content = [child for child in run if child.tag != run_properties_tag]
+                    if not any(child.tag == text_tag and (child.text or "") for child in content):
+                        parent = run.getparent()
+                        if parent is not None:
+                            parent.remove(run)
+
+    @staticmethod
+    def _restore_math_roman_styles(document: object) -> None:
+        """Restore explicit ``\\mathrm``, ``\\exp``, and ``\\ln`` styling.
+
+        TeX4ht's editable equation path emits the right OMML structure but
+        does not carry ``\\mathrm`` through to the final Word run properties.
+        The export-only source contains temporary markers around those spans;
+        this method removes the markers and applies explicit roman/plain math
+        styling to the runs between them.  Ordinary math runs are untouched.
+        """
+
+        math_namespace = "{http://schemas.openxmlformats.org/officeDocument/2006/math}"
+        paragraph_tag = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p"
+        math_tag = math_namespace + "oMath"
+        run_tag = math_namespace + "r"
+        run_properties_tag = math_namespace + "rPr"
+        text_tag = math_namespace + "t"
+        script_tag = math_namespace + "scr"
+        style_tag = math_namespace + "sty"
+
+        def set_roman_style(run: object) -> None:
+            properties = run.find(run_properties_tag)
+            if properties is None:
+                from docx.oxml import OxmlElement  # type: ignore[import-not-found]
+
+                properties = OxmlElement("m:rPr")
+                run.insert(0, properties)
+            script = properties.find(script_tag)
+            if script is None:
+                from docx.oxml import OxmlElement  # type: ignore[import-not-found]
+
+                script = OxmlElement("m:scr")
+                properties.append(script)
+            script.set("{http://schemas.openxmlformats.org/officeDocument/2006/math}val", "roman")
+            style = properties.find(style_tag)
+            if style is None:
+                from docx.oxml import OxmlElement  # type: ignore[import-not-found]
+
+                style = OxmlElement("m:sty")
+                properties.append(style)
+            style.set("{http://schemas.openxmlformats.org/officeDocument/2006/math}val", "p")
+
+        body = document.element.body  # type: ignore[attr-defined]
+        for paragraph in body.iter(paragraph_tag):
+            for formula in paragraph.iter(math_tag):
+                depth = 0
+                changed = False
+                for run in list(formula.iter(run_tag)):
+                    text_nodes = list(run.iter(text_tag))
+                    run_text = "".join(node.text or "" for node in text_nodes)
+                    starts = len(re.findall(r"PDFRomanS\d{3}", run_text))
+                    ends = len(re.findall(r"PDFRomanE\d{3}", run_text))
+                    if starts or ends:
+                        changed = True
+                    if depth or starts:
+                        set_roman_style(run)
+                    for node in text_nodes:
+                        if node.text and _ROMAN_MARKER_RE.search(node.text):
+                            node.text = _ROMAN_MARKER_RE.sub("", node.text)
+                    depth += starts - ends
+                    depth = max(0, depth)
+
+                if not changed:
+                    continue
                 for run in list(formula.iter(run_tag)):
                     content = [child for child in run if child.tag != run_properties_tag]
                     if not any(child.tag == text_tag and (child.text or "") for child in content):
