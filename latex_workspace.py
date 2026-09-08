@@ -351,6 +351,9 @@ _TEX4HT_STANDALONE_ALIGNMENT_RE = re.compile(
     re.DOTALL,
 )
 _TEX4HT_INLINE_DOLLAR_RE = re.compile(r"(?<!\$)\$(?!\$)([^$\n]+?)\$(?!\$)")
+_TEX_SIZE_DELIMITER_RE = re.compile(
+    r"\\(?:big|Big|bigg|Bigg|bigl|Bigl|biggl|Biggl|bigr|Bigr|biggr|Biggr)\s*(\\[{}]|[()[\]])"
+)
 _TEX_ENV_TOKEN_RE = re.compile(r"\\(begin|end)\s*\{(parts|solution)\}")
 _BOX_MARKER_RE = re.compile(r"PDFBox[SE]\d{3}")
 _EQUALITY_MARKER_RE = re.compile(r"PDFEq\d{3}")
@@ -454,6 +457,24 @@ def _flatten_nested_exam_solutions(source: str) -> str:
     return "".join(output)
 
 
+def _normalise_size_delimiters(source: str) -> str:
+    r"""Export ``\big``-style delimiters as native scalable delimiters.
+
+    TeX4ht's ODT backend can emit an empty MathML delimiter for commands such
+    as ``\big(``, leaving the fraction or expression outside the delimiter in
+    the resulting Word equation.  ``\left``/``\right`` uses the same visible
+    parentheses while producing one editable OMML delimiter around the
+    expression.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        delimiter = match.group(1)
+        closing = delimiter in (")", "]", r"\}")
+        return (r"\right" if closing else r"\left") + delimiter
+
+    return _TEX_SIZE_DELIMITER_RE.sub(replace, source)
+
+
 def _tex4ht_source(source: str) -> str:
     """Make alignment-heavy math safe for TeX4ht's ODT backend.
 
@@ -499,6 +520,7 @@ def _tex4ht_source(source: str) -> str:
         )
 
     source = _flatten_nested_exam_solutions(source)
+    source = _normalise_size_delimiters(source)
     source = _mark_boxed_math(source)
     # TeX4ht's MathML writer can emit malformed fragments for thin-space
     # commands inside long ``\mathrm`` subscripts.  Ordinary TeX spaces keep
@@ -858,12 +880,21 @@ class LatexSourceDocxConverter:
         if parent is not None:
             parent.remove(element)
 
+    @staticmethod
+    def _paragraph_has_embedded_object(paragraph: object) -> bool:
+        element = paragraph._p  # type: ignore[attr-defined]
+        return bool(element.xpath(".//w:drawing")) or bool(element.xpath(".//w:pict"))
+
     def _clean_header(self, document: object) -> None:
         """Turn TeX4ht's underscore rules into real Word borders."""
 
         paragraphs = list(document.paragraphs)  # type: ignore[attr-defined]
         first_question = next(
-            (index for index, paragraph in enumerate(paragraphs) if re.fullmatch(r"\d+\.", paragraph.text.strip())),
+            (
+                index
+                for index, paragraph in enumerate(paragraphs)
+                if re.match(r"^\d+\.\s*(?:\[\d+\s+points?\])?(?:\s|$)", paragraph.text.strip())
+            ),
             len(paragraphs),
         )
         for index, paragraph in enumerate(paragraphs[:first_question]):
@@ -871,12 +902,16 @@ class LatexSourceDocxConverter:
                 for run in paragraph.runs:
                     run.text = run.text.replace("_", "")
                 self._set_paragraph_border(paragraph, ("bottom",))
-            elif not paragraph.text.strip():
+            elif not paragraph.text.strip() and not self._paragraph_has_embedded_object(paragraph):
                 self._delete_paragraph(paragraph)
 
         tables = list(document.tables)  # type: ignore[attr-defined]
         if tables:
             table = tables[0]
+            header_source = re.split(r"\\begin\s*\{questions\}", self.source_text, maxsplit=1)[0]
+            header_has_vertical_rules = bool(
+                re.search(r"\\begin\s*\{tabular\}\s*\{[^}]*\|", header_source)
+            )
             for row in list(table.rows):
                 if not any(cell.text.strip() for cell in row.cells):
                     row._tr.getparent().remove(row._tr)
@@ -887,17 +922,22 @@ class LatexSourceDocxConverter:
                 for cell_index, cell in enumerate(row.cells[:-1]):
                     properties = cell._tc.get_or_add_tcPr()
                     borders = properties.find(qn("w:tcBorders"))
-                    if borders is None:
+                    if header_has_vertical_rules and borders is None:
                         borders = OxmlElement("w:tcBorders")
                         properties.append(borders)
+                    if borders is None:
+                        continue
                     right = borders.find(qn("w:right"))
-                    if right is None:
+                    if header_has_vertical_rules and right is None:
                         right = OxmlElement("w:right")
                         borders.append(right)
-                    right.set(qn("w:val"), "single")
-                    right.set(qn("w:sz"), "4")
-                    right.set(qn("w:space"), "0")
-                    right.set(qn("w:color"), "000000")
+                    if header_has_vertical_rules and right is not None:
+                        right.set(qn("w:val"), "single")
+                        right.set(qn("w:sz"), "4")
+                        right.set(qn("w:space"), "0")
+                        right.set(qn("w:color"), "000000")
+                    elif right is not None:
+                        borders.remove(right)
 
     @staticmethod
     def _normalise_question_text(text: str) -> str:
@@ -919,62 +959,78 @@ class LatexSourceDocxConverter:
         return specs
 
     def _restore_question_points(self, document: object) -> None:
-        """Restore question totals and missing question labels from source order."""
+        """Restore question labels inline with their editable question text."""
 
         paragraphs = list(document.paragraphs)  # type: ignore[attr-defined]
         specs = self._question_specs()
         for question_number, (points, lead) in enumerate(specs, start=1):
             if not lead:
                 continue
+
+            def question_body(text: str) -> str:
+                normalised = self._normalise_question_text(text)
+                return re.sub(
+                    r"^\d+\.\s*(?:\[\d+\s+points?\])?\s*",
+                    "",
+                    normalised,
+                )
+
             candidate_index = next(
                 (
                     index
                     for index, paragraph in enumerate(paragraphs)
-                    if self._normalise_question_text(paragraph.text).startswith(lead)
+                    if question_body(paragraph.text).startswith(lead)
                 ),
                 None,
             )
             if candidate_index is None:
                 continue
 
-            label_index = next(
-                (
-                    index
-                    for index in range(candidate_index - 1, -1, -1)
-                    if re.fullmatch(r"\d+\.", paragraphs[index].text.strip())
-                ),
-                None,
-            )
             label = f"{question_number}."
             if points:
                 label += f" [{points} points]"
-            if label_index is None:
-                marker = (
-                    paragraphs[candidate_index - 1]
-                    if candidate_index > 0
-                    else None
-                )
-                if (
-                    marker is not None
-                    and marker.style
-                    and marker.style.name == "Inside-enumerate"
-                    and not marker.text.strip()
-                ):
-                    self._delete_paragraph(marker)
-                    paragraphs.remove(marker)
-                    candidate_index -= 1
-                paragraph = paragraphs[candidate_index].insert_paragraph_before(label)
-                paragraph.style = document.styles["dt"]  # type: ignore[attr-defined]
-                for run in paragraph.runs:
-                    run.bold = True
-                paragraphs.insert(candidate_index, paragraph)
-                continue
 
-            paragraph = paragraphs[label_index]
-            paragraph.text = label
+            marker = paragraphs[candidate_index - 1] if candidate_index > 0 else None
+            if (
+                marker is not None
+                and marker.style
+                and marker.style.name == "Inside-enumerate"
+                and not marker.text.strip()
+            ):
+                self._delete_paragraph(marker)
+                paragraphs.remove(marker)
+                candidate_index -= 1
+
+            paragraph = paragraphs[candidate_index]
+            previous_index = candidate_index - 1
+            while previous_index >= 0 and not paragraphs[previous_index].text.strip():
+                previous_index -= 1
+            if (
+                previous_index >= 0
+                and re.fullmatch(r"\d+\.\s*(?:\[\d+\s+points?\])?", paragraphs[previous_index].text.strip())
+            ):
+                old_label = paragraphs[previous_index]
+                self._delete_paragraph(old_label)
+                paragraphs.pop(previous_index)
+                candidate_index -= 1
+                paragraph = paragraphs[candidate_index]
+
+            label_pattern = re.compile(r"^\d+\.\s*(?:\[\d+\s+points?\])?\s*")
+            first_text_run = next((run for run in paragraph.runs if run.text), None)
+            if first_text_run is not None and label_pattern.match(first_text_run.text or ""):
+                first_text_run.text = label_pattern.sub(label + " ", first_text_run.text, count=1)
+            else:
+                prefix_run = paragraph.add_run(label + " ")
+                prefix_run.bold = False
+                prefix_element = prefix_run._r
+                prefix_element.getparent().remove(prefix_element)
+                insert_at = 1 if paragraph._p.pPr is not None else 0
+                paragraph._p.insert(insert_at, prefix_element)
+
             paragraph.style = document.styles["dt"]  # type: ignore[attr-defined]
             for run in paragraph.runs:
-                run.bold = True
+                if run.bold is None:
+                    run.bold = False
 
     @staticmethod
     def _clean_leaked_part_points(document: object) -> None:
@@ -1004,23 +1060,71 @@ class LatexSourceDocxConverter:
         return points
 
     def _restore_part_points(self, document: object) -> None:
-        """Restore point totals on top-level exam parts."""
+        """Restore point totals on top-level exam parts and keep labels inline."""
 
         points = self._source_question_part_points()
-        part_paragraphs = [
+        paragraphs = [
             paragraph
             for paragraph in document.paragraphs  # type: ignore[attr-defined]
-            if re.fullmatch(r"(?:\[\d+ points\])?\([a-z]\)", paragraph.text.strip())
+            if re.fullmatch(
+                r"(?:\[\d+\s+points?\]\s*)?\([a-z]\)(?:\s*\[\d+\s+points?\])?",
+                paragraph.text.strip(),
+            )
         ]
-        for paragraph, value in zip(part_paragraphs, points):
+        for paragraph, value in zip(paragraphs, points):
             if not value:
                 continue
             label = re.search(r"\([a-z]\)", paragraph.text.strip())
             if label is None:
                 continue
-            paragraph.text = f"{label.group(0)} [{value} points]"
+            rendered_label = f"{label.group(0)} [{value} points]"
+            paragraph.text = rendered_label
             for run in paragraph.runs:
-                run.bold = True
+                run.bold = False
+
+            # A minipage after \part is emitted by TeX4ht as a label paragraph,
+            # an empty paragraph, and then the actual question text.  The PDF
+            # presents these as one line, so move the editable label into the
+            # following text paragraph when that structure is present.
+            all_paragraphs = list(document.paragraphs)  # type: ignore[attr-defined]
+            paragraph_index = next(
+                (index for index, item in enumerate(all_paragraphs) if item._p is paragraph._p),
+                None,
+            )
+            if paragraph_index is None:
+                continue
+            next_index = paragraph_index + 1
+            empty_paragraphs: list[object] = []
+            while (
+                next_index < len(all_paragraphs)
+                and not all_paragraphs[next_index].text.strip()
+                and not self._paragraph_has_embedded_object(all_paragraphs[next_index])
+            ):
+                empty_paragraphs.append(all_paragraphs[next_index])
+                next_index += 1
+            if next_index >= len(all_paragraphs):
+                continue
+            body = all_paragraphs[next_index]
+            if self._paragraph_has_embedded_object(body):
+                continue
+            if re.match(r"^(?:\d+\.|\([a-z]\))", body.text.strip()):
+                continue
+            for empty in empty_paragraphs:
+                self._delete_paragraph(empty)
+            first_text_run = next((run for run in body.runs if run.text), None)
+            if first_text_run is not None:
+                first_text_run.text = rendered_label + " " + first_text_run.text
+            else:
+                prefix_run = body.add_run(rendered_label + " ")
+                prefix_element = prefix_run._r
+                prefix_element.getparent().remove(prefix_element)
+                insert_at = 1 if body._p.pPr is not None else 0
+                body._p.insert(insert_at, prefix_element)
+            body.style = document.styles["dt"]  # type: ignore[attr-defined]
+            for run in body.runs:
+                if run.bold is None:
+                    run.bold = False
+            self._delete_paragraph(paragraph)
 
     @staticmethod
     def _restore_leading_equals(document: object) -> None:
@@ -1309,7 +1413,7 @@ class LatexSourceDocxConverter:
             for child in body_children[current_index + 1 :]:
                 if child.tag.endswith("}p"):
                     paragraph = Paragraph(child, document)
-                    if re.fullmatch(r"\d+\.\s*\[\d+ points\]", paragraph.text.strip()):
+                    if re.match(r"^\d+\.\s*\[\d+ points\](?:\s|$)", paragraph.text.strip()):
                         break
                     moved.append(child)
                 elif child.tag.endswith("}tbl"):
@@ -1330,7 +1434,7 @@ class LatexSourceDocxConverter:
         for start in reversed(starts):
             end = len(paragraphs)
             for index in range(start + 1, len(paragraphs)):
-                if re.fullmatch(r"\d+\.\s*\[\d+ points\]", paragraphs[index].text.strip()):
+                if re.match(r"^\d+\.\s*\[\d+ points\](?:\s|$)", paragraphs[index].text.strip()):
                     end = index
                     break
             if end <= start:
