@@ -232,7 +232,7 @@ def _recover_graphics_from_pdf(
 def _wrapper_source(body_name: str) -> str:
     return f"""\\documentclass[10pt]{{exam}}
 \\usepackage[margin=1in]{{geometry}}
-\\usepackage{{amsmath,amssymb,enumitem,graphicx}}
+\\usepackage{{amsmath,amssymb,enumitem,graphicx,float,color,siunitx,setspace,gensymb}}
 \\pointformat{{[\\thepoints]}}
 \\printanswers
 \\begin{{document}}
@@ -354,7 +354,6 @@ _TEX4HT_INLINE_DOLLAR_RE = re.compile(r"(?<!\$)\$(?!\$)([^$\n]+?)\$(?!\$)")
 _TEX_SIZE_DELIMITER_RE = re.compile(
     r"\\(?:big|Big|bigg|Bigg|bigl|Bigl|biggl|Biggl|bigr|Bigr|biggr|Biggr)\s*(\\[{}]|[()[\]])"
 )
-_TEX_ROMAN_OPERATOR_RE = re.compile(r"\\(exp|ln)(?![A-Za-z])")
 _TEX_ENV_TOKEN_RE = re.compile(r"\\(begin|end)\s*\{(parts|solution)\}")
 _BOX_MARKER_RE = re.compile(r"PDFBox[SE]\d{3}")
 _EQUALITY_MARKER_RE = re.compile(r"PDFEq\d{3}")
@@ -418,7 +417,7 @@ def _flatten_nested_exam_solutions(source: str) -> str:
     """
 
     solution_block = re.compile(
-        r"\\begin\s*\{solution\}(.*?)\\end\s*\{solution\}",
+        r"\\begin\s*\{solution\}(?:\s*\[[^]]*\])?(.*?)\\end\s*\{solution\}",
         re.DOTALL,
     )
     output: list[str] = []
@@ -439,10 +438,11 @@ def _flatten_nested_exam_solutions(source: str) -> str:
         output.append(prefix)
         update_parts_depth(prefix)
 
-        if parts_depth == 0:
+        body = match.group(1)
+        contains_parts = re.search(r"\\begin\s*\{parts\}", body) is not None
+        if parts_depth == 0 and not contains_parts:
             output.append(match.group(0))
         else:
-            body = match.group(1)
             body = body.replace(
                 r"\begin{parts}", r"\begin{enumerate}[label=(\alph*)]"
             )
@@ -457,6 +457,31 @@ def _flatten_nested_exam_solutions(source: str) -> str:
         cursor = match.end()
     output.append(source[cursor:])
     return "".join(output)
+
+
+def _flatten_exam_lists(source: str) -> str:
+    """Convert ``exam`` part lists to TeX4ht-safe ``enumerate`` lists.
+
+    TeX4ht's ODT backend can create malformed XML when ``parts`` contains
+    ``subparts``.  Standard ``enumerate`` lists retain the same editable
+    labels while avoiding that invalid list topology.  This is used only for
+    the source copy passed to TeX4ht; normal PDF compilation is unchanged.
+    """
+
+    source = re.sub(
+        r"\\begin\s*\{parts\}",
+        r"\\begin{enumerate}[label=(\\alph*)]",
+        source,
+    )
+    source = re.sub(r"\\end\s*\{parts\}", r"\\end{enumerate}", source)
+    source = re.sub(r"\\part\b(?:\s*\[[^]]*\])?", r"\\item", source)
+    source = re.sub(
+        r"\\begin\s*\{subparts\}",
+        r"\\begin{enumerate}[label=(\\roman*)]",
+        source,
+    )
+    source = re.sub(r"\\end\s*\{subparts\}", r"\\end{enumerate}", source)
+    return re.sub(r"\\subpart\b(?:\s*\[[^]]*\])?", r"\\item", source)
 
 
 def _normalise_size_delimiters(source: str) -> str:
@@ -478,14 +503,17 @@ def _normalise_size_delimiters(source: str) -> str:
 
 
 def _mark_roman_math(source: str) -> str:
-    r"""Mark source-level roman math spans so Word can restore their style.
+    r"""Mark explicit ``\mathrm`` spans so Word can restore their style.
 
     The ODT route preserves the equation structure but loses the distinction
-    between ordinary math italic and ``\mathrm``.  Text markers survive that
+    between ordinary math italic and ``\mathrm``. Text markers survive that
     conversion, allowing the DOCX postprocessor to apply native OMML roman
-    styling only to the requested spans.  The parser is deliberately small:
-    it only needs to find balanced ``\mathrm{...}`` groups and the common
-    operator commands ``\exp`` and ``\ln``.
+    styling only to the requested spans.
+
+    Do not mark standard operators such as ``\exp`` and ``\ln``. TeX4ht
+    already exports those as one MathML identifier followed by a function
+    application character. Wrapping them in ``\mathrm`` splits the operator
+    into separate letters, which Word then displays as ``e x p`` or ``l n``.
     """
 
     output: list[str] = []
@@ -516,6 +544,21 @@ def _mark_roman_math(source: str) -> str:
                         depth -= 1
                     index += 1
                 if depth == 0:
+                    # TeX4ht can split a ``\mathrm`` group across separate
+                    # MathML objects when it is a subscript or superscript.
+                    # That leaves the surrounding ODT XML malformed and
+                    # makes LibreOffice silently discard all subsequent
+                    # content.  A plain brace group keeps the complete
+                    # subscript/superscript intact; TeX4ht emits it as math
+                    # italics, but it remains editable and structurally valid.
+                    if source[:cursor].rstrip().endswith(("_", "^")):
+                        content = source[brace + 1 : index - 1]
+                        if re.fullmatch(r"[A-Za-z0-9 ]+", content):
+                            output.append(rf"{{{content}}}")
+                        else:
+                            output.append(source[cursor:index])
+                        cursor = index
+                        continue
                     start_marker, end_marker = marker_pair()
                     content = source[brace + 1 : index - 1]
                     output.append(source[cursor : brace + 1])
@@ -525,15 +568,6 @@ def _mark_roman_math(source: str) -> str:
                     output.append("}")
                     cursor = index
                     continue
-
-        operator = _TEX_ROMAN_OPERATOR_RE.match(source, cursor)
-        if operator is not None:
-            start_marker, end_marker = marker_pair()
-            output.append(
-                rf"\mathrm{{\text{{{start_marker}}}{operator.group(1)}\text{{{end_marker}}}}}"
-            )
-            cursor = operator.end()
-            continue
 
         output.append(source[cursor])
         cursor += 1
@@ -586,6 +620,7 @@ def _tex4ht_source(source: str) -> str:
         )
 
     source = _flatten_nested_exam_solutions(source)
+    source = _flatten_exam_lists(source)
     source = _normalise_size_delimiters(source)
     source = _mark_boxed_math(source)
     # TeX4ht's MathML writer can emit malformed fragments for thin-space
@@ -605,9 +640,10 @@ def _tex4ht_source(source: str) -> str:
     def preserve_inline_word_space(match: re.Match[str]) -> str:
         following = source[match.end() :]
         next_significant = re.match(r"\s*(\S)", following)
+        rendered = "$" + match.group(1).replace(">>", r"\gg{}") + "$"
         if next_significant and (next_significant.group(1).isalnum() or next_significant.group(1) == "\\"):
-            return match.group(0) + r"\ "
-        return match.group(0)
+            return rendered + r"\ "
+        return rendered
 
     return _TEX4HT_INLINE_DOLLAR_RE.sub(preserve_inline_word_space, source)
 
@@ -832,8 +868,10 @@ class LatexSourceDocxConverter:
         tex4ht_project = export_root / "project"
         odt_dir = export_root / "odt"
         docx_dir = export_root / "docx"
+        office_profile = export_root / "libreoffice-profile"
         odt_dir.mkdir()
         docx_dir.mkdir()
+        office_profile.mkdir()
         shutil.copytree(project_dir, tex4ht_project)
 
         if _is_standalone_tex(self.source_text):
@@ -863,7 +901,16 @@ class LatexSourceDocxConverter:
         odt_for_import = _repair_odt_manifest(odt_path)
         self._notify(status_callback, "Converting editable equations to Word format...")
         office_result = subprocess.run(
-            [soffice, "--headless", "--convert-to", "docx", "--outdir", str(docx_dir), str(odt_for_import)],
+            [
+                soffice,
+                "--headless",
+                f"-env:UserInstallation={office_profile.as_uri()}",
+                "--convert-to",
+                "docx",
+                "--outdir",
+                str(docx_dir),
+                str(odt_for_import),
+            ],
             cwd=str(docx_dir),
             capture_output=True,
             text=True,
@@ -877,14 +924,34 @@ class LatexSourceDocxConverter:
                 "LibreOffice could not finish the editable Word export. Make sure LibreOffice is installed and try again.",
             )
 
+        staging_path: Path | None = None
         try:
-            shutil.copy2(generated_docx, output)
-        except OSError as exc:
+            descriptor, staging_name = tempfile.mkstemp(
+                prefix=f".{output.stem}-",
+                suffix=".docx",
+                dir=output.parent,
+            )
+            os.close(descriptor)
+            staging_path = Path(staging_name)
+            shutil.copy2(generated_docx, staging_path)
+            self._postprocess_docx(staging_path, project_dir)
+            self._validate_postprocessed_docx(staging_path)
+            os.replace(staging_path, output)
+            staging_path = None
+        except LatexWorkspaceError:
+            raise
+        except Exception as exc:
+            LOGGER.exception("Could not finish editable DOCX post-processing: %s", output)
             raise LatexWorkspaceError(
-                f"Could not save the DOCX to {output}: {exc}",
-                "The editable Word file could not be saved to the selected location.",
+                f"Could not finish the DOCX at {output}: {exc}",
+                "The editable Word export could not finish repairing its equations. The destination file was not replaced.",
             ) from exc
-        self._postprocess_docx(output, project_dir)
+        finally:
+            if staging_path is not None:
+                try:
+                    staging_path.unlink(missing_ok=True)
+                except OSError:
+                    LOGGER.warning("Could not remove incomplete DOCX staging file: %s", staging_path)
         return str(output)
 
     @staticmethod
@@ -919,13 +986,37 @@ class LatexSourceDocxConverter:
         self._clean_leaked_part_points(document)
         self._restore_part_points(document)
         self._restore_leading_equals(document)
+        self._restore_integral_limits(document)
         self._restore_math_roman_styles(document)
         self._restore_boxed_equations(document)
         self._restore_list_labels(document)
+        self._restore_question_pagebreaks(document)
+        self._restore_solution_pagebreaks(document)
         self._restore_solution_frames(document)
+        self._keep_math_punctuation_together(document)
         self._add_page_numbers(document)
         self._insert_figures(document, project_dir)
         document.save(str(docx_path))
+
+    @staticmethod
+    def _validate_postprocessed_docx(docx_path: Path) -> None:
+        """Reject a DOCX if private conversion markers leaked into its math."""
+
+        marker = re.compile(rb"PDF(?:Box[SE]|Eq|Roman[SE])\d{3}")
+        try:
+            with zipfile.ZipFile(docx_path, "r") as archive:
+                document_xml = archive.read("word/document.xml")
+        except (OSError, KeyError, zipfile.BadZipFile) as exc:
+            raise LatexWorkspaceError(
+                f"The post-processed DOCX is not a valid Word package: {docx_path}",
+                "The editable Word export produced an invalid document package. The destination file was not replaced.",
+            ) from exc
+        leaked = sorted(set(match.group(0).decode("ascii") for match in marker.finditer(document_xml)))
+        if leaked:
+            raise LatexWorkspaceError(
+                f"Private equation markers remain in {docx_path}: {', '.join(leaked)}",
+                "The editable Word export could not finish repairing its equations. The destination file was not replaced.",
+            )
 
     @staticmethod
     def _set_paragraph_border(paragraph: object, sides: tuple[str, ...]) -> None:
@@ -997,8 +1088,14 @@ class LatexSourceDocxConverter:
                     row._tr.getparent().remove(row._tr)
             from docx.oxml import OxmlElement  # type: ignore[import-not-found]
             from docx.oxml.ns import qn  # type: ignore[import-not-found]
+            from docx.shared import Pt  # type: ignore[import-not-found]
 
             for row in table.rows:
+                for cell in row.cells:
+                    for paragraph in cell.paragraphs:
+                        paragraph.paragraph_format.space_before = Pt(0)
+                        paragraph.paragraph_format.space_after = Pt(0)
+                        paragraph.paragraph_format.line_spacing = 1
                 for cell_index, cell in enumerate(row.cells[:-1]):
                     properties = cell._tc.get_or_add_tcPr()
                     borders = properties.find(qn("w:tcBorders"))
@@ -1087,8 +1184,29 @@ class LatexSourceDocxConverter:
                 previous_index -= 1
             if (
                 previous_index >= 0
-                and re.fullmatch(r"\d+\.\s*(?:\[\d+\s+points?\])?", paragraphs[previous_index].text.strip())
+                # TeX4ht normally emits a question label as ``2.`` but can
+                # put the previous question's point total in front of it,
+                # e.g. ``[10 points]2.``.  Treat both forms as a detached
+                # label.  Leaving the latter behind makes the solution-frame
+                # pass absorb it into the preceding answer box.
+                and re.fullmatch(
+                    r"(?:\[\d+\s+points?\]\s*)?\d+\.\s*(?:\[\d+\s+points?\])?",
+                    paragraphs[previous_index].text.strip(),
+                )
             ):
+                # A detached TeX4ht question label is often followed by an
+                # otherwise empty list paragraph.  Once the label is moved
+                # inline, that paragraph has no semantic content and would
+                # become a blank trailing row in the preceding solution frame.
+                for empty in list(paragraphs[previous_index + 1 : candidate_index]):
+                    if (
+                        not empty.text.strip()
+                        and not self._paragraph_has_embedded_object(empty)
+                        and not empty._p.xpath(".//w:br")  # type: ignore[attr-defined]
+                    ):
+                        self._delete_paragraph(empty)
+                        paragraphs.remove(empty)
+                        candidate_index -= 1
                 old_label = paragraphs[previous_index]
                 self._delete_paragraph(old_label)
                 paragraphs.pop(previous_index)
@@ -1125,7 +1243,7 @@ class LatexSourceDocxConverter:
     def _source_question_part_points(self) -> list[str | None]:
         token_re = re.compile(
             r"\\begin\s*\{solution\}|\\end\s*\{solution\}"
-            r"|\\part\s*(?:\[(\d+)\])?"
+            r"|\\part\b\s*(?:\[(\d+)\])?"
         )
         solution_depth = 0
         points: list[str | None] = []
@@ -1234,15 +1352,155 @@ class LatexSourceDocxConverter:
                         if parent is not None:
                             parent.remove(run)
 
+    def _source_integral_limits(self) -> list[tuple[str | None, str | None]]:
+        """Return ``(lower, upper)`` limits for source integrals in order."""
+
+        source = re.sub(r"(?m)(?<!\\)%.*$", "", self.source_text)
+
+        def argument(index: int) -> tuple[str | None, int]:
+            while index < len(source) and source[index].isspace():
+                index += 1
+            if index >= len(source):
+                return None, index
+            if source[index] == "{":
+                depth = 1
+                cursor = index + 1
+                while cursor < len(source) and depth:
+                    character = source[cursor]
+                    escaped = cursor > 0 and source[cursor - 1] == "\\"
+                    if character == "{" and not escaped:
+                        depth += 1
+                    elif character == "}" and not escaped:
+                        depth -= 1
+                    cursor += 1
+                if depth == 0:
+                    return source[index + 1 : cursor - 1], cursor
+                return None, index
+            if source[index] == "\\":
+                command = re.match(r"\\[A-Za-z]+|\\.", source[index:])
+                if command is not None:
+                    return command.group(0), index + len(command.group(0))
+            return source[index], index + 1
+
+        limits: list[tuple[str | None, str | None]] = []
+        for match in re.finditer(r"\\int(?![A-Za-z])", source):
+            cursor = match.end()
+            lower: str | None = None
+            upper: str | None = None
+            for _unused in range(2):
+                while cursor < len(source) and source[cursor].isspace():
+                    cursor += 1
+                if cursor >= len(source) or source[cursor] not in "_^":
+                    break
+                marker = source[cursor]
+                value, cursor = argument(cursor + 1)
+                if marker == "_":
+                    lower = value
+                else:
+                    upper = value
+            limits.append((lower, upper))
+        return limits
+
+    @staticmethod
+    def _append_simple_tex_math(parent: object, expression: str) -> None:
+        """Append the small TeX subset commonly used for integral limits."""
+
+        from docx.oxml import OxmlElement  # type: ignore[import-not-found]
+        from docx.oxml.ns import qn  # type: ignore[import-not-found]
+
+        replacements = {
+            r"\infty": "∞",
+            r"\pm": "±",
+            r"\mp": "∓",
+        }
+
+        def add_run(container: object, text: str) -> None:
+            run = OxmlElement("m:r")
+            node = OxmlElement("m:t")
+            node.set(qn("xml:space"), "preserve")
+            node.text = text
+            run.append(node)
+            container.append(run)
+
+        compact = expression.strip()
+        sign = ""
+        if compact.startswith(("+", "-")):
+            sign = "+" if compact[0] == "+" else "−"
+            compact = compact[1:].strip()
+        for command, character in replacements.items():
+            compact = compact.replace(command, character)
+        compact = compact.replace("{", "").replace("}", "")
+        subscript = re.fullmatch(r"([^_]+)_([A-Za-z0-9]+)", compact)
+        if sign:
+            add_run(parent, sign)
+        if subscript is None:
+            add_run(parent, compact)
+            return
+
+        scripted = OxmlElement("m:sSub")
+        base = OxmlElement("m:e")
+        add_run(base, subscript.group(1))
+        sub = OxmlElement("m:sub")
+        add_run(sub, subscript.group(2))
+        scripted.extend((base, sub))
+        parent.append(scripted)
+
+    def _restore_integral_limits(self, document: object) -> None:
+        """Restore integral bounds that LibreOffice drops during ODT import."""
+
+        from docx.oxml import OxmlElement  # type: ignore[import-not-found]
+
+        math_namespace = "{http://schemas.openxmlformats.org/officeDocument/2006/math}"
+        nary_tag = math_namespace + "nary"
+        nary_properties_tag = math_namespace + "naryPr"
+        character_tag = math_namespace + "chr"
+        sub_hide_tag = math_namespace + "subHide"
+        sup_hide_tag = math_namespace + "supHide"
+        sub_tag = math_namespace + "sub"
+        sup_tag = math_namespace + "sup"
+        value_attribute = math_namespace + "val"
+
+        integrals: list[object] = []
+        for nary in document.element.body.iter(nary_tag):  # type: ignore[attr-defined]
+            properties = nary.find(nary_properties_tag)
+            character = properties.find(character_tag) if properties is not None else None
+            if character is not None and character.get(value_attribute) == "∫":
+                integrals.append(nary)
+
+        for nary, (lower, upper) in zip(integrals, self._source_integral_limits()):
+            properties = nary.find(nary_properties_tag)
+            if properties is None:
+                continue
+            for tag, expression, hide_tag in (
+                (sub_tag, lower, sub_hide_tag),
+                (sup_tag, upper, sup_hide_tag),
+            ):
+                target = nary.find(tag)
+                if target is None:
+                    target = OxmlElement("m:sub" if tag == sub_tag else "m:sup")
+                    expression_node = nary.find(math_namespace + "e")
+                    insert_at = nary.index(expression_node) if expression_node is not None else len(nary)
+                    nary.insert(insert_at, target)
+                for child in list(target):
+                    target.remove(child)
+                hidden = properties.find(hide_tag)
+                if hidden is None:
+                    hidden = OxmlElement("m:subHide" if hide_tag == sub_hide_tag else "m:supHide")
+                    properties.append(hidden)
+                hidden.set(value_attribute, "0" if expression is not None else "1")
+                if expression is not None:
+                    self._append_simple_tex_math(target, expression)
+
     @staticmethod
     def _restore_math_roman_styles(document: object) -> None:
-        """Restore explicit ``\\mathrm``, ``\\exp``, and ``\\ln`` styling.
+        """Restore explicit ``\\mathrm`` styling and remove its markers.
 
         TeX4ht's editable equation path emits the right OMML structure but
         does not carry ``\\mathrm`` through to the final Word run properties.
         The export-only source contains temporary markers around those spans;
-        this method removes the markers and applies explicit roman/plain math
-        styling to the runs between them.  Ordinary math runs are untouched.
+        this method removes the markers, applies explicit roman/plain math
+        styling, and joins adjacent letters into one OMML run. Ordinary math
+        runs and TeX4ht's native function runs are untouched.
         """
 
         math_namespace = "{http://schemas.openxmlformats.org/officeDocument/2006/math}"
@@ -1276,11 +1534,50 @@ class LatexSourceDocxConverter:
                 properties.append(style)
             style.set("{http://schemas.openxmlformats.org/officeDocument/2006/math}val", "p")
 
+        def merge_group(group: list[object]) -> None:
+            """Merge adjacent roman math letters so Word does not space them."""
+
+            if len(group) < 2:
+                return
+            first = group[0]
+            parent = first.getparent()
+            if parent is None:
+                return
+            contiguous = [first]
+            previous_index = parent.index(first)
+            for run in group[1:]:
+                if run.getparent() is not parent:
+                    break
+                run_index = parent.index(run)
+                if run_index != previous_index + 1:
+                    break
+                contiguous.append(run)
+                previous_index = run_index
+            if len(contiguous) < 2:
+                return
+
+            combined = "".join(
+                "".join(node.text or "" for node in run.iter(text_tag))
+                for run in contiguous
+            )
+            first_text_nodes = list(first.iter(text_tag))
+            if not first_text_nodes:
+                return
+            first_text_nodes[0].text = combined
+            for extra_text in first_text_nodes[1:]:
+                extra_parent = extra_text.getparent()
+                if extra_parent is not None:
+                    extra_parent.remove(extra_text)
+            for run in contiguous[1:]:
+                parent.remove(run)
+
         body = document.element.body  # type: ignore[attr-defined]
         for paragraph in body.iter(paragraph_tag):
             for formula in paragraph.iter(math_tag):
                 depth = 0
                 changed = False
+                current_group: list[object] = []
+                completed_groups: list[list[object]] = []
                 for run in list(formula.iter(run_tag)):
                     text_nodes = list(run.iter(text_tag))
                     run_text = "".join(node.text or "" for node in text_nodes)
@@ -1288,13 +1585,22 @@ class LatexSourceDocxConverter:
                     ends = len(re.findall(r"PDFRomanE\d{3}", run_text))
                     if starts or ends:
                         changed = True
-                    if depth or starts:
-                        set_roman_style(run)
                     for node in text_nodes:
                         if node.text and _ROMAN_MARKER_RE.search(node.text):
                             node.text = _ROMAN_MARKER_RE.sub("", node.text)
-                    depth += starts - ends
-                    depth = max(0, depth)
+                    if starts:
+                        if depth == 0:
+                            current_group = []
+                        depth += starts
+                    has_text = any(node.text for node in text_nodes)
+                    if depth and has_text:
+                        set_roman_style(run)
+                        current_group.append(run)
+                    if ends:
+                        depth = max(0, depth - ends)
+                        if depth == 0 and current_group:
+                            completed_groups.append(current_group)
+                            current_group = []
 
                 if not changed:
                     continue
@@ -1304,6 +1610,8 @@ class LatexSourceDocxConverter:
                         parent = run.getparent()
                         if parent is not None:
                             parent.remove(run)
+                for group in completed_groups:
+                    merge_group(group)
 
     def _restore_boxed_equations(self, document: object) -> None:
         """Convert temporary markers into native OMML border boxes."""
@@ -1390,30 +1698,28 @@ class LatexSourceDocxConverter:
         """Return editable labels for TeX list items in source order."""
 
         token_re = re.compile(
-            r"\\begin\s*\{(enumerate|parts|solution)\}\s*(?:\[([^]]*)\])?"
-            r"|\\end\s*\{(enumerate|parts|solution)\}"
-            r"|\\(item|part)\b",
+            r"\\begin\s*\{(enumerate|parts|subparts)\}\s*(?:\[([^]]*)\])?"
+            r"|\\end\s*\{(enumerate|parts|subparts)\}"
+            r"|\\(item|part|subpart)\b",
             re.DOTALL,
         )
         stack: list[tuple[str, str]] = []
-        solution_depth = 0
-        solution_nested_in_parts: list[bool] = []
         labels: list[str] = []
         counters: list[int] = []
         for match in token_re.finditer(self.source_text):
             begin_environment, options, end_environment, item_kind = match.groups()
             if begin_environment:
-                if begin_environment == "solution":
-                    solution_depth += 1
-                    solution_nested_in_parts.append(any(name == "parts" for name, _ in stack))
-                    continue
                 if begin_environment == "parts":
                     stack.append((begin_environment, "alpha"))
+                elif begin_environment == "subparts":
+                    stack.append((begin_environment, "roman_lower"))
                 else:
                     option_text = options or ""
                     if "Roman" in option_text:
                         style = "roman"
-                    elif "alph" in option_text or "alpha" in option_text:
+                    elif "roman" in option_text:
+                        style = "roman_lower"
+                    elif "alph" in option_text.lower() or "alpha" in option_text.lower():
                         style = "alpha"
                     else:
                         style = "arabic"
@@ -1421,33 +1727,26 @@ class LatexSourceDocxConverter:
                 counters.append(0)
                 continue
             if end_environment:
-                if end_environment == "solution":
-                    solution_depth = max(0, solution_depth - 1)
-                    if solution_nested_in_parts:
-                        solution_nested_in_parts.pop()
-                elif stack:
+                if stack:
                     stack.pop()
                     counters.pop()
                 continue
             if not stack or not counters:
                 continue
             environment, style = stack[-1]
-            if item_kind == "part":
-                if (
-                    environment != "parts"
-                    or solution_depth == 0
-                    or not solution_nested_in_parts[-1]
-                ):
-                    continue
-            elif item_kind == "item":
-                if environment != "enumerate":
-                    continue
-            else:
+            expected_item = {
+                "enumerate": "item",
+                "parts": "part",
+                "subparts": "subpart",
+            }[environment]
+            if item_kind != expected_item:
                 continue
             counters[-1] += 1
             number = counters[-1]
             if style == "roman":
                 labels.append(self._roman_label(number))
+            elif style == "roman_lower":
+                labels.append(self._roman_label(number).lower())
             elif style == "alpha":
                 labels.append(self._alpha_label(number))
             else:
@@ -1462,29 +1761,36 @@ class LatexSourceDocxConverter:
 
         source_labels = self._source_list_labels()
         label_index = 0
-        number = 0
-        in_list = False
         for paragraph in document.paragraphs:  # type: ignore[attr-defined]
             style_name = paragraph.style.name if paragraph.style else ""
             if style_name != "Inside-enumerate":
-                in_list = False
                 continue
-            number = number + 1 if in_list else 1
-            in_list = True
+            properties = paragraph._p.pPr
+            numbering = properties.find(qn("w:numPr")) if properties is not None else None
+            number_id = numbering.find(qn("w:numId")) if numbering is not None else None
+            is_list_item = number_id is not None and number_id.get(qn("w:val")) not in (None, "0")
             # Remove the numbering style and preserve the visual indent as
             # direct formatting so the number can be edited like normal text.
             paragraph.style = document.styles["dd"]  # type: ignore[attr-defined]
-            properties = paragraph._p.pPr
             if properties is not None:
-                numbering = properties.find(qn("w:numPr"))
                 if numbering is not None:
                     properties.remove(numbering)
             paragraph.paragraph_format.left_indent = Inches(0.45)
             paragraph.paragraph_format.first_line_indent = Inches(-0.2)
-            if label_index < len(source_labels):
-                label = source_labels[label_index]
-            else:
-                label = f"{number}."
+            if not is_list_item:
+                # TeX4ht uses ``numId=0`` for continuation paragraphs inside
+                # a list. They inherit ``Inside-enumerate`` but must not
+                # consume or display another source item label.
+                paragraph.paragraph_format.first_line_indent = Inches(0)
+                continue
+            if label_index >= len(source_labels):
+                # TeX4ht occasionally assigns ``Inside-enumerate`` to a
+                # trailing paragraph within the final list item.  It is
+                # continuation text, not a new list entry, so remove the
+                # presentation numbering without inventing a new label.
+                paragraph.paragraph_format.first_line_indent = Inches(0)
+                continue
+            label = source_labels[label_index]
             label_index += 1
             prefix_run = paragraph.add_run(f"{label} ")
             prefix_element = prefix_run._r
@@ -1529,6 +1835,8 @@ class LatexSourceDocxConverter:
     def _restore_solution_frames(self, document: object) -> None:
         """Keep TeX4ht's solution paragraphs inside their editable frame."""
 
+        from docx.oxml import OxmlElement  # type: ignore[import-not-found]
+        from docx.oxml.ns import qn  # type: ignore[import-not-found]
         from docx.table import Table  # type: ignore[import-not-found]
         from docx.text.paragraph import Paragraph  # type: ignore[import-not-found]
 
@@ -1588,17 +1896,154 @@ class LatexSourceDocxConverter:
                 if re.match(r"^\d+\.\s*\[\d+ points\](?:\s|$)", paragraphs[index].text.strip()):
                     end = index
                     break
+            # TeX4ht can leave an empty list paragraph after a solution's
+            # final display equation.  If it is moved into the frame, Writer
+            # may split just that empty row onto the next page as a blank box.
+            # Retain real page breaks and embedded content, but discard these
+            # trailing conversion artifacts before creating the table.
+            while (
+                end > start
+                and not paragraphs[end - 1].text.strip()
+                and not self._paragraph_has_embedded_object(paragraphs[end - 1])
+                and not paragraphs[end - 1]._p.xpath(".//w:br")  # type: ignore[attr-defined]
+            ):
+                self._delete_paragraph(paragraphs[end - 1])
+                end -= 1
             if end <= start:
                 continue
+            page_break_before = bool(paragraphs[start].paragraph_format.page_break_before)
+            if page_break_before:
+                paragraphs[start].paragraph_format.page_break_before = False
             table = document.add_table(rows=1, cols=1)  # type: ignore[attr-defined]
             self._frame_table(table)
             table_element = table._tbl
             body = document._body._body  # type: ignore[attr-defined]
             body.remove(table_element)
             body.insert(body.index(paragraphs[start]._p), table_element)
+            if page_break_before:
+                break_paragraph = OxmlElement("w:p")
+                break_properties = OxmlElement("w:pPr")
+                break_before = OxmlElement("w:pageBreakBefore")
+                break_before.set(qn("w:val"), "true")
+                break_properties.append(break_before)
+                break_paragraph.append(break_properties)
+                body.insert(body.index(table_element), break_paragraph)
             cell = table.cell(0, 0)
             for index in range(start, end):
                 cell._tc.append(paragraphs[index]._p)
+
+    def _restore_question_pagebreaks(self, document: object) -> None:
+        """Restore explicit source page breaks that TeX4ht drops before questions."""
+
+        # A source ``\\pagebreak`` commonly becomes only an empty ODT list
+        # paragraph.  Find its position among the source questions, then make
+        # the following restored Word question start a new page.
+        source = re.sub(r"(?m)(?<!\\)%.*$", "", self.source_text)
+        token_re = re.compile(r"\\question\b|\\(?:pagebreak|newpage|clearpage)\b")
+        questions_before = 0
+        pagebreak_after_questions: list[int] = []
+        for match in token_re.finditer(source):
+            if match.group(0).startswith(r"\question"):
+                questions_before += 1
+            elif questions_before:
+                pagebreak_after_questions.append(questions_before)
+
+        if not pagebreak_after_questions:
+            return
+        question_paragraphs = [
+            paragraph
+            for paragraph in document.paragraphs  # type: ignore[attr-defined]
+            if re.match(r"^\d+\.\s*\[\d+\s+points?\](?:\s|$)", paragraph.text.strip())
+        ]
+        for next_question_index in pagebreak_after_questions:
+            if next_question_index < len(question_paragraphs):
+                question_paragraphs[next_question_index].paragraph_format.page_break_before = True
+
+    def _restore_solution_pagebreaks(self, document: object) -> None:
+        """Restore explicit source page breaks immediately before solutions."""
+
+        source = re.sub(r"(?m)(?<!\\)%.*$", "", self.source_text)
+        token_re = re.compile(
+            r"\\(?:pagebreak|newpage|clearpage)\b"
+            r"|\\question\b"
+            r"|\\begin\s*\{solution\}"
+        )
+        pending_pagebreak = False
+        solution_index = 0
+        pagebreak_solutions: list[int] = []
+        for match in token_re.finditer(source):
+            token = match.group(0)
+            if token.startswith(r"\begin"):
+                if pending_pagebreak:
+                    pagebreak_solutions.append(solution_index)
+                solution_index += 1
+                pending_pagebreak = False
+            elif token.startswith(r"\question"):
+                pending_pagebreak = False
+            else:
+                pending_pagebreak = True
+
+        if not pagebreak_solutions:
+            return
+        solution_paragraphs = [
+            paragraph
+            for paragraph in document.paragraphs  # type: ignore[attr-defined]
+            if paragraph.text.strip().startswith("Solution:")
+        ]
+        for index in pagebreak_solutions:
+            if index < len(solution_paragraphs):
+                solution_paragraphs[index].paragraph_format.page_break_before = True
+
+    @staticmethod
+    def _keep_math_punctuation_together(document: object) -> None:
+        """Prevent a closing punctuation mark from wrapping away from inline math."""
+
+        word_namespace = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+        math_namespace = "{http://schemas.openxmlformats.org/officeDocument/2006/math}"
+        paragraph_tag = word_namespace + "p"
+        run_tag = word_namespace + "r"
+        text_tag = word_namespace + "t"
+        math_tag = math_namespace + "oMath"
+        math_text_tag = math_namespace + "t"
+        closing_punctuation = ".,;:!?)]}"
+
+        for paragraph in document.element.body.iter(paragraph_tag):  # type: ignore[attr-defined]
+            children = list(paragraph)
+            for index, child in enumerate(children[:-1]):
+                if child.tag != math_tag:
+                    continue
+                for preceding in reversed(children[:index]):
+                    if preceding.tag != run_tag:
+                        break
+                    preceding_text = preceding.find(text_tag)
+                    if preceding_text is None or not preceding_text.text:
+                        continue
+                    opening = re.search(r"([\(\[\{])\s*$", preceding_text.text)
+                    if opening is not None:
+                        math_text_nodes = list(child.iter(math_text_tag))
+                        if math_text_nodes:
+                            first_math_text = math_text_nodes[0]
+                            first_math_text.text = opening.group(1) + (first_math_text.text or "")
+                            preceding_text.text = preceding_text.text[: opening.start(1)]
+                    break
+                following = children[index + 1]
+                if following.tag != run_tag:
+                    continue
+                text = following.find(text_tag)
+                if text is None or not text.text or text.text[0] not in closing_punctuation:
+                    continue
+                punctuation = re.match(r"[.,;:!?\)\]\}]+", text.text)
+                if punctuation is None:
+                    continue
+                math_text_nodes = list(child.iter(math_text_tag))
+                if not math_text_nodes:
+                    continue
+                last_math_text = math_text_nodes[-1]
+                last_math_text.text = (last_math_text.text or "") + punctuation.group(0)
+                remaining = text.text[punctuation.end() :]
+                if remaining.startswith(" "):
+                    remaining = "\u00a0" + remaining[1:]
+                text.text = remaining
 
 
     @staticmethod
@@ -1664,28 +2109,54 @@ class LatexSourceDocxConverter:
                 "Install the project requirements, then try editable Word export again.",
             ) from exc
 
-        anchors = [
-            paragraph
+        placements: list[tuple[object, str]] = [
+            (paragraph, "after")
             for paragraph in document.paragraphs
             if "shown below" in paragraph.text
             or ("shown" in paragraph.text and "Figure" in paragraph.text)
         ]
-        if len(anchors) < len(figure_paths):
+        if len(placements) < len(figure_paths):
             # Some TeX4ht versions split or simplify the figure sentence.
             # Use a nearby figure reference as a final source-aware anchor.
-            anchors = [
-                paragraph
+            placements = [
+                (paragraph, "after")
                 for paragraph in document.paragraphs
                 if "Figure" in paragraph.text or "figure" in paragraph.text
             ]
-        if len(anchors) < len(figure_paths):
+        if len(placements) < len(figure_paths):
+            # A plain figure environment may have no caption or prose saying
+            # "Figure". Anchor it immediately before the first prose that
+            # follows the corresponding includegraphics command in source.
+            placements = []
+            for graphic_match in INCLUDE_GRAPHICS_RE.finditer(self.source_text):
+                following = self.source_text[graphic_match.end() :]
+                figure_end = re.search(r"\\end\s*\{figure\}", following)
+                if figure_end is not None:
+                    following = following[figure_end.end() :]
+                lead = " ".join(self._normalise_question_text(following).split()[:8])
+                if not lead:
+                    continue
+                anchor = next(
+                    (
+                        paragraph
+                        for paragraph in document.paragraphs
+                        if self._normalise_question_text(paragraph.text).startswith(lead)
+                    ),
+                    None,
+                )
+                if anchor is not None:
+                    placements.append((anchor, "before"))
+        if len(placements) < len(figure_paths):
             LOGGER.warning("Could not locate all figure anchors in the generated DOCX.")
             return
 
         widths = _graphics_widths(self.source_text)
-        for anchor, figure_path in zip(anchors, figure_paths):
+        for (anchor, position), figure_path in zip(placements, figure_paths):
             paragraph_element = OxmlElement("w:p")
-            anchor._p.addnext(paragraph_element)
+            if position == "before":
+                anchor._p.addprevious(paragraph_element)
+            else:
+                anchor._p.addnext(paragraph_element)
             paragraph = Paragraph(paragraph_element, anchor._parent)
             paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
             paragraph.paragraph_format.space_before = Pt(3)
