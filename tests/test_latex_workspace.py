@@ -11,6 +11,8 @@ from latex_workspace import (
     CompileResult,
     LatexSourceDocxConverter,
     LatexWorkspaceError,
+    _deduplicate_placeholder_labels,
+    _find_reference_pdf,
     _mark_roman_math,
     _tex4ht_source,
 )
@@ -58,6 +60,63 @@ class RomanMathTests(unittest.TestCase):
         transformed = _tex4ht_source(r"Energy $\Delta\varepsilon>>kT$ is large.")
 
         self.assertIn(r"$\Delta\varepsilon\gg{}kT$", transformed)
+
+
+class PlaceholderLabelTests(unittest.TestCase):
+    def test_repeated_active_placeholder_labels_are_removed(self) -> None:
+        source = (
+            "\\begin{figure}\\label{fig:placeholder}First\\end{figure}\n"
+            "\\begin{figure}\\label { fig:placeholder }Second\\end{figure}\n"
+        )
+
+        transformed, removed = _deduplicate_placeholder_labels(source)
+
+        self.assertEqual(removed, 1)
+        self.assertEqual(transformed.count("fig:placeholder"), 1)
+        self.assertIn("Second", transformed)
+
+    def test_commented_placeholder_labels_do_not_count_as_active(self) -> None:
+        source = (
+            "% \\label{fig:placeholder}\n"
+            "Text \\% literal \\label{fig:placeholder}\n"
+            "More text \\label{fig:placeholder} % \\label{fig:placeholder}\n"
+        )
+
+        transformed, removed = _deduplicate_placeholder_labels(source)
+
+        self.assertEqual(removed, 1)
+        self.assertEqual(transformed.count("fig:placeholder"), 3)
+        self.assertTrue(transformed.startswith("% \\label{fig:placeholder}"))
+
+
+class ReferencePdfTests(unittest.TestCase):
+    def test_spaced_solution_pdf_matches_compact_tex_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tex_path = root / "Quiz9.tex"
+            question_pdf = root / "Quiz 9.pdf"
+            solution_pdf = root / "Quiz 9 Solution.pdf"
+            tex_path.touch()
+            question_pdf.touch()
+            solution_pdf.touch()
+
+            matched = _find_reference_pdf(tex_path, r"\begin{solution}Answer\end{solution}")
+
+            self.assertEqual(matched, solution_pdf)
+
+    def test_question_pdf_wins_when_source_has_no_solutions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tex_path = root / "Quiz9.tex"
+            question_pdf = root / "Quiz 9.pdf"
+            solution_pdf = root / "Quiz 9 Solution.pdf"
+            tex_path.touch()
+            question_pdf.touch()
+            solution_pdf.touch()
+
+            matched = _find_reference_pdf(tex_path, "Question only")
+
+            self.assertEqual(matched, question_pdf)
 
 
 class IntegralLimitTests(unittest.TestCase):

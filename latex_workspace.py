@@ -25,6 +25,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable
+
+from runtime_environment import relaunch_in_project_venv_if_needed
+
+
+if __name__ == "__main__":
+    relaunch_in_project_venv_if_needed((("pymupdf", "fitz"), ("docx",)))
+
+
 from converter import (
     VisualFidelityConverter,
     normalise_output_path,
@@ -38,6 +46,7 @@ INCLUDE_GRAPHICS_RE = re.compile(
 INCLUDE_GRAPHICS_DETAILS_RE = re.compile(
     r"\\includegraphics\s*(?:\[([^]]*)\])?\s*\{([^}]+)\}"
 )
+PLACEHOLDER_LABEL_RE = re.compile(r"\\label\s*\{\s*fig:placeholder\s*\}")
 
 
 class LatexWorkspaceError(Exception):
@@ -90,6 +99,47 @@ def _graphics_widths(source: str) -> dict[str, float]:
     return widths
 
 
+def _tex_comment_start(line: str) -> int | None:
+    """Return the first unescaped TeX comment marker in a source line."""
+
+    for index, character in enumerate(line):
+        if character != "%":
+            continue
+        preceding_backslashes = 0
+        cursor = index - 1
+        while cursor >= 0 and line[cursor] == "\\":
+            preceding_backslashes += 1
+            cursor -= 1
+        if preceding_backslashes % 2 == 0:
+            return index
+    return None
+
+
+def _deduplicate_placeholder_labels(source: str) -> tuple[str, int]:
+    """Remove repeated active placeholder labels from a temporary TeX copy."""
+
+    seen = False
+    removed = 0
+    output: list[str] = []
+
+    for line in source.splitlines(keepends=True):
+        comment_start = _tex_comment_start(line)
+        active = line if comment_start is None else line[:comment_start]
+        comment = "" if comment_start is None else line[comment_start:]
+
+        def replace(match: re.Match[str]) -> str:
+            nonlocal seen, removed
+            if not seen:
+                seen = True
+                return match.group(0)
+            removed += 1
+            return ""
+
+        output.append(PLACEHOLDER_LABEL_RE.sub(replace, active) + comment)
+
+    return "".join(output), removed
+
+
 def _find_graphic(source_dir: Path, requested_name: str) -> Path | None:
     requested = Path(requested_name)
     candidates = [source_dir / requested]
@@ -104,27 +154,35 @@ def _find_graphic(source_dir: Path, requested_name: str) -> Path | None:
 def _reference_name_tokens(path: Path) -> set[str]:
     """Normalize a TeX/PDF filename for conservative project matching."""
 
-    return set(re.findall(r"[a-z0-9]+", path.stem.lower()))
+    stem = re.sub(r"(?<=[a-z])(?=\d)|(?<=\d)(?=[a-z])", " ", path.stem.lower())
+    return set(re.findall(r"[a-z0-9]+", stem))
 
 
-def _find_reference_pdf(tex_path: Path) -> Path | None:
+def _normalized_reference_stem(path: Path) -> str:
+    return "".join(re.findall(r"[a-z0-9]+", path.stem.lower()))
+
+
+def _find_reference_pdf(tex_path: Path, source: str = "") -> Path | None:
     """Find the most likely matching reference PDF beside a source file."""
-
-    exact = tex_path.with_suffix(".pdf")
-    if exact.is_file():
-        return exact
 
     source_tokens = _reference_name_tokens(tex_path)
     if not source_tokens:
         return None
-    candidates: list[tuple[int, Path]] = []
+    if re.search(r"\\begin\s*\{solution\}", source):
+        source_tokens.add("solution")
+
+    normalized_source = _normalized_reference_stem(tex_path)
+    candidates: list[tuple[tuple[int, int, int], Path]] = []
     for candidate in sorted(tex_path.parent.glob("*.pdf")):
-        overlap = len(source_tokens & _reference_name_tokens(candidate))
-        if overlap >= 2:
-            candidates.append((overlap, candidate))
+        candidate_tokens = _reference_name_tokens(candidate)
+        overlap = len(source_tokens & candidate_tokens)
+        exact_stem = int(_normalized_reference_stem(candidate) == normalized_source)
+        if overlap >= 2 or exact_stem:
+            extra_tokens = len(candidate_tokens - source_tokens)
+            candidates.append(((overlap, exact_stem, -extra_tokens), candidate))
     if not candidates:
         return None
-    candidates.sort(key=lambda item: (-item[0], item[1].name.lower()))
+    candidates.sort(key=lambda item: (item[0], item[1].name.lower()), reverse=True)
     best_score = candidates[0][0]
     best = [candidate for score, candidate in candidates if score == best_score]
     return best[0] if len(best) == 1 else None
@@ -588,6 +646,7 @@ def _tex4ht_source(source: str) -> str:
     preview remain unchanged.
     """
 
+    source, _removed_placeholder_labels = _deduplicate_placeholder_labels(source)
     equality_marker_number = 1
 
     def rows(body: str) -> list[str]:
@@ -2217,25 +2276,33 @@ def compile_latex(
     project_dir.mkdir()
     build_dir.mkdir()
 
-    standalone = _is_standalone_tex(source_text)
+    build_source, removed_placeholder_labels = _deduplicate_placeholder_labels(source_text)
+    standalone = _is_standalone_tex(build_source)
     setup_warnings: list[str] = []
+    if removed_placeholder_labels:
+        setup_warnings.append(
+            "Ignored "
+            f"{removed_placeholder_labels} repeated \\label{{fig:placeholder}} marker(s) "
+            "in the temporary build copy."
+        )
     if standalone:
         main_name = tex_path.name
         main_path = project_dir / main_name
-        main_path.write_text(source_text, encoding="utf-8")
+        main_path.write_text(build_source, encoding="utf-8")
     else:
         body_name = "source_body.tex"
-        (project_dir / body_name).write_text(source_text, encoding="utf-8")
+        (project_dir / body_name).write_text(build_source, encoding="utf-8")
         main_name = "main.tex"
         template_path = _find_master_template(tex_path, source_text)
         if template_path is None:
             wrapper = _wrapper_source(body_name)
         else:
-            wrapper, setup_warnings = _template_wrapper_source(
+            wrapper, template_warnings = _template_wrapper_source(
                 template_path,
                 body_name,
                 project_dir,
             )
+            setup_warnings.extend(template_warnings)
         (project_dir / main_name).write_text(wrapper, encoding="utf-8")
 
     _copy_existing_graphics(tex_path.parent, project_dir, source_text)
@@ -2421,7 +2488,7 @@ class LatexWorkspaceApp:
         self.editor.delete("1.0", "end")
         self.editor.insert("1.0", source)
         self.last_compiled_text = ""
-        self.reference_pdf = _find_reference_pdf(self.tex_path)
+        self.reference_pdf = _find_reference_pdf(self.tex_path, source)
         self.path_var.set(str(self.tex_path))
         self.reference_var.set(
             f"Reference PDF: {self.reference_pdf.name}" if self.reference_pdf else "Reference PDF: automatic"

@@ -14,6 +14,13 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable
 
+from runtime_environment import relaunch_in_project_venv_if_needed
+
+
+if __name__ == "__main__":
+    relaunch_in_project_venv_if_needed((("pymupdf", "fitz"), ("docx",)))
+
+
 from converter import (
     MacWordConverter,
     PDFConversionError,
