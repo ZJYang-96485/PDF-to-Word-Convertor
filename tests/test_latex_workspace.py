@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from docx import Document
 from docx.oxml import OxmlElement
@@ -13,8 +14,11 @@ from latex_workspace import (
     LatexWorkspaceError,
     _deduplicate_placeholder_labels,
     _find_reference_pdf,
+    _graphics_names,
     _mark_roman_math,
+    _move_solution_parts_preambles,
     _tex4ht_source,
+    _wrapper_source,
 )
 
 
@@ -89,6 +93,50 @@ class PlaceholderLabelTests(unittest.TestCase):
         self.assertTrue(transformed.startswith("% \\label{fig:placeholder}"))
 
 
+class GraphicsDiscoveryTests(unittest.TestCase):
+    def test_commented_graphics_are_ignored(self) -> None:
+        source = (
+            "\\includegraphics{active.png}\n"
+            "% \\includegraphics{commented.png}\n"
+            "Text % \\includegraphics{inline-commented.png}\n"
+            "Escaped \\% \\includegraphics{also-active.png}\n"
+        )
+
+        self.assertEqual(_graphics_names(source), ["active.png", "also-active.png"])
+
+
+class WrapperTests(unittest.TestCase):
+    def test_fallback_wrapper_supports_aboxed(self) -> None:
+        self.assertIn("mathtools", _wrapper_source("source_body.tex"))
+
+
+class SolutionPartsTests(unittest.TestCase):
+    def test_introductory_text_moves_before_parts_list(self) -> None:
+        source = (
+            "\\begin{solution}\n"
+            "\\begin{parts}\n"
+            "Given: $x=1$.\n"
+            "\\[y=2\\]\n"
+            "\\part First answer.\n"
+            "\\end{parts}\n"
+            "\\end{solution}\n"
+        )
+
+        transformed, moved = _move_solution_parts_preambles(source)
+
+        self.assertEqual(moved, 1)
+        self.assertLess(transformed.index("Given:"), transformed.index(r"\begin{parts}"))
+        self.assertLess(transformed.index(r"\begin{parts}"), transformed.index(r"\part"))
+
+    def test_parts_list_starting_with_part_is_unchanged(self) -> None:
+        source = r"\begin{solution}\begin{parts}\part Answer.\end{parts}\end{solution}"
+
+        transformed, moved = _move_solution_parts_preambles(source)
+
+        self.assertEqual(moved, 0)
+        self.assertEqual(transformed, source)
+
+
 class ReferencePdfTests(unittest.TestCase):
     def test_spaced_solution_pdf_matches_compact_tex_name(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -117,6 +165,33 @@ class ReferencePdfTests(unittest.TestCase):
             matched = _find_reference_pdf(tex_path, "Question only")
 
             self.assertEqual(matched, question_pdf)
+
+    @mock.patch("latex_workspace._reference_pdf_image_count")
+    def test_tied_names_prefer_pdf_with_all_source_figures(
+        self,
+        image_count: mock.Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tex_path = root / "HW10 (1).tex"
+            small_pdf = root / "HW10 Solution.pdf"
+            complete_pdf = root / "HW 10 Solution.pdf"
+            tex_path.touch()
+            small_pdf.touch()
+            complete_pdf.touch()
+            image_count.side_effect = lambda path: 9 if path == complete_pdf else 3
+            source = (
+                r"\begin{solution}"
+                r"\includegraphics{one.png}"
+                r"\includegraphics{two.png}"
+                r"\includegraphics{three.png}"
+                r"\includegraphics{four.png}"
+                r"\end{solution}"
+            )
+
+            matched = _find_reference_pdf(tex_path, source)
+
+            self.assertEqual(matched, complete_pdf)
 
 
 class IntegralLimitTests(unittest.TestCase):

@@ -47,6 +47,14 @@ INCLUDE_GRAPHICS_DETAILS_RE = re.compile(
     r"\\includegraphics\s*(?:\[([^]]*)\])?\s*\{([^}]+)\}"
 )
 PLACEHOLDER_LABEL_RE = re.compile(r"\\label\s*\{\s*fig:placeholder\s*\}")
+SOLUTION_PARTS_PREAMBLE_RE = re.compile(
+    r"(?P<solution>\\begin\s*\{solution\}(?:\s*\[[^]]*\])?)"
+    r"(?P<between>\s*)"
+    r"(?P<parts>\\begin\s*\{parts\})"
+    r"(?P<leading>(?:(?!\\end\s*\{parts\}).)*?)"
+    r"(?=\\part\b)",
+    re.DOTALL,
+)
 
 
 class LatexWorkspaceError(Exception):
@@ -81,7 +89,7 @@ def _is_standalone_tex(source: str) -> bool:
 
 def _graphics_names(source: str) -> list[str]:
     names: list[str] = []
-    for raw_name in INCLUDE_GRAPHICS_RE.findall(source):
+    for raw_name in INCLUDE_GRAPHICS_RE.findall(_without_tex_comments(source)):
         name = raw_name.strip()
         if name and name not in names:
             names.append(name)
@@ -92,7 +100,9 @@ def _graphics_widths(source: str) -> dict[str, float]:
     """Return explicit ``includegraphics`` widths in inches when available."""
 
     widths: dict[str, float] = {}
-    for options, raw_name in INCLUDE_GRAPHICS_DETAILS_RE.findall(source):
+    for options, raw_name in INCLUDE_GRAPHICS_DETAILS_RE.findall(
+        _without_tex_comments(source)
+    ):
         match = re.search(r"(?:^|,)\s*width\s*=\s*([0-9.]+)\s*in\b", options)
         if match:
             widths.setdefault(raw_name.strip(), float(match.group(1)))
@@ -113,6 +123,16 @@ def _tex_comment_start(line: str) -> int | None:
         if preceding_backslashes % 2 == 0:
             return index
     return None
+
+
+def _without_tex_comments(source: str) -> str:
+    """Return TeX source with unescaped line comments removed."""
+
+    active_lines: list[str] = []
+    for line in source.splitlines(keepends=True):
+        comment_start = _tex_comment_start(line)
+        active_lines.append(line if comment_start is None else line[:comment_start] + "\n")
+    return "".join(active_lines)
 
 
 def _deduplicate_placeholder_labels(source: str) -> tuple[str, int]:
@@ -140,6 +160,32 @@ def _deduplicate_placeholder_labels(source: str) -> tuple[str, int]:
     return "".join(output), removed
 
 
+def _move_solution_parts_preambles(source: str) -> tuple[str, int]:
+    """Move introductory solution text before an ``exam`` parts list."""
+
+    moved = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal moved
+        leading = match.group("leading")
+        visible_leading = []
+        for line in leading.splitlines():
+            comment_start = _tex_comment_start(line)
+            visible_leading.append(line if comment_start is None else line[:comment_start])
+        if not "\n".join(visible_leading).strip():
+            return match.group(0)
+        moved += 1
+        return (
+            match.group("solution")
+            + match.group("between")
+            + leading
+            + match.group("parts")
+            + "\n"
+        )
+
+    return SOLUTION_PARTS_PREAMBLE_RE.sub(replace, source), moved
+
+
 def _find_graphic(source_dir: Path, requested_name: str) -> Path | None:
     requested = Path(requested_name)
     candidates = [source_dir / requested]
@@ -162,6 +208,30 @@ def _normalized_reference_stem(path: Path) -> str:
     return "".join(re.findall(r"[a-z0-9]+", path.stem.lower()))
 
 
+def _reference_pdf_image_count(path: Path) -> int | None:
+    """Return the number of unique embedded PDF images when available."""
+
+    try:
+        import pymupdf as fitz  # type: ignore[import-not-found]
+    except ImportError:
+        try:
+            import fitz  # type: ignore[import-not-found]
+        except ImportError:
+            return None
+    try:
+        document = fitz.open(str(path))
+        with document:
+            return len(
+                {
+                    int(image[0])
+                    for page in document
+                    for image in page.get_images(full=True)
+                }
+            )
+    except Exception:
+        return None
+
+
 def _find_reference_pdf(tex_path: Path, source: str = "") -> Path | None:
     """Find the most likely matching reference PDF beside a source file."""
 
@@ -172,14 +242,23 @@ def _find_reference_pdf(tex_path: Path, source: str = "") -> Path | None:
         source_tokens.add("solution")
 
     normalized_source = _normalized_reference_stem(tex_path)
-    candidates: list[tuple[tuple[int, int, int], Path]] = []
+    required_images = len(_graphics_names(source))
+    candidates: list[tuple[tuple[int, int, int, int, int], Path]] = []
     for candidate in sorted(tex_path.parent.glob("*.pdf")):
         candidate_tokens = _reference_name_tokens(candidate)
         overlap = len(source_tokens & candidate_tokens)
         exact_stem = int(_normalized_reference_stem(candidate) == normalized_source)
         if overlap >= 2 or exact_stem:
             extra_tokens = len(candidate_tokens - source_tokens)
-            candidates.append(((overlap, exact_stem, -extra_tokens), candidate))
+            image_count = _reference_pdf_image_count(candidate) if required_images else None
+            enough_images = int(image_count is not None and image_count >= required_images)
+            image_distance = -abs(image_count - required_images) if image_count is not None else -10**9
+            candidates.append(
+                (
+                    (overlap, exact_stem, enough_images, image_distance, -extra_tokens),
+                    candidate,
+                )
+            )
     if not candidates:
         return None
     candidates.sort(key=lambda item: (item[0], item[1].name.lower()), reverse=True)
@@ -290,7 +369,7 @@ def _recover_graphics_from_pdf(
 def _wrapper_source(body_name: str) -> str:
     return f"""\\documentclass[10pt]{{exam}}
 \\usepackage[margin=1in]{{geometry}}
-\\usepackage{{amsmath,amssymb,enumitem,graphicx,float,color,siunitx,setspace,gensymb}}
+\\usepackage{{amsmath,amssymb,mathtools,enumitem,graphicx,float,color,siunitx,setspace,gensymb}}
 \\pointformat{{[\\thepoints]}}
 \\printanswers
 \\begin{{document}}
@@ -305,10 +384,7 @@ _TEX_INPUT_RE = re.compile(r"\\(?:input|include)\s*\{([^}]+)\}")
 def _active_tex_references(source: str) -> list[str]:
     """Return local file references from non-commented TeX lines."""
 
-    active_source = "\n".join(
-        line for line in source.splitlines() if not line.lstrip().startswith("%")
-    )
-    return _TEX_INPUT_RE.findall(active_source)
+    return _TEX_INPUT_RE.findall(_without_tex_comments(source))
 
 
 def _find_master_template(tex_path: Path, source: str) -> Path | None:
@@ -646,6 +722,7 @@ def _tex4ht_source(source: str) -> str:
     preview remain unchanged.
     """
 
+    source, _moved_parts_preambles = _move_solution_parts_preambles(source)
     source, _removed_placeholder_labels = _deduplicate_placeholder_labels(source)
     equality_marker_number = 1
 
@@ -2276,9 +2353,15 @@ def compile_latex(
     project_dir.mkdir()
     build_dir.mkdir()
 
-    build_source, removed_placeholder_labels = _deduplicate_placeholder_labels(source_text)
+    build_source, moved_parts_preambles = _move_solution_parts_preambles(source_text)
+    build_source, removed_placeholder_labels = _deduplicate_placeholder_labels(build_source)
     standalone = _is_standalone_tex(build_source)
     setup_warnings: list[str] = []
+    if moved_parts_preambles:
+        setup_warnings.append(
+            "Moved introductory solution text before "
+            f"{moved_parts_preambles} parts list(s) in the temporary build copy."
+        )
     if removed_placeholder_labels:
         setup_warnings.append(
             "Ignored "
